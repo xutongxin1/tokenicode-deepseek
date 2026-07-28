@@ -1,0 +1,184 @@
+name: Build EXE + Auto Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (leave blank for auto dev-YYYYMMDD-HHMM)'
+        required: false
+        type: string
+        default: ''
+      draft:
+        description: 'Create as draft release?'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - release-exe
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -- determine version ------------------------------------------------
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            TAG_VER="${{ inputs.version }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            TAG_VER="dev-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          else
+            TAG_VER="dev-$(date +%Y%m%d-%H%M)"
+          fi
+          # semver-safe version string for tauri.conf.json / Cargo.toml
+          # must be MAJOR.MINOR.PATCH[-prerelease]
+          SEMVER="0.0.0-dev"
+          echo "tag=$TAG_VER" >> $GITHUB_OUTPUT
+          echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+          echo "release_name=TOKENICODE-from-xtx $TAG_VER" >> $GITHUB_OUTPUT
+
+      # -- inject "from xtx" branding into config ---------------------------
+      - name: Patch branding into configs
+        shell: bash
+        run: |
+          # 1. tauri.conf.json — product name + window title
+          node -e "
+          const fs = require('fs');
+          const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8'));
+          conf.productName = 'TOKENICODE-from-xtx';
+          conf.version = '${{ steps.version.outputs.semver }}';
+          conf.app.windows[0].title = 'TOKENICODE from xtx';
+          conf.bundle.createUpdaterArtifacts = false;
+          conf.bundle.windows = { ...(conf.bundle.windows || {}), nsis: { installMode: 'currentUser' } };
+          fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2));
+          console.log('tauri.conf.json patched:', conf.productName, conf.version);
+          "
+
+          # 2. Cargo.toml — version + description (for .exe metadata)
+          node -e "
+          const fs = require('fs');
+          let cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          cargo = cargo.replace(/^version = \".*\"$/m, 'version = \"${{ steps.version.outputs.semver }}\"');
+          cargo = cargo.replace(/^description = \".*\"$/m, 'description = \"TOKENICODE DeepSeek Alpha from xtx\"');
+          fs.writeFileSync('src-tauri/Cargo.toml', cargo);
+          console.log('Cargo.toml patched');
+          "
+
+      # -- toolchain --------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      # -- build ------------------------------------------------------------
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (Windows EXE + MSI)
+        shell: bash
+        env:
+          EDITION: dev
+        run: |
+          # first attempt: full build
+          # if NSIS download times out, the .exe + .msi are already built
+          pnpm tauri build --bundles msi,nsis 2>&1 || true
+
+          echo "--- built artifacts ---"
+          ls -lh src-tauri/target/release/tokenicode.exe
+          ls -lh src-tauri/target/release/bundle/msi/  2>/dev/null || echo "(no msi)"
+          ls -lh src-tauri/target/release/bundle/nsis/ 2>/dev/null || echo "(no nsis)"
+
+      # -- prepare release assets -------------------------------------------
+      - name: Gather release assets
+        id: gather
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          VER="${{ steps.version.outputs.tag }}"
+
+          # standalone exe
+          EXE="src-tauri/target/release/tokenicode.exe"
+          if [ -f "$EXE" ]; then
+            cp "$EXE" "release-assets/TOKENICODE-from-xtx_${VER}_x64.exe"
+          fi
+
+          # msi installer
+          MSI_DIR="src-tauri/target/release/bundle/msi"
+          if [ -d "$MSI_DIR" ]; then
+            for f in "$MSI_DIR"/*.msi; do
+              [ -f "$f" ] && cp "$f" "release-assets/TOKENICODE-from-xtx_${VER}_x64.msi"
+            done
+          fi
+
+          # nsis installer (may not exist if download failed)
+          NSIS_DIR="src-tauri/target/release/bundle/nsis"
+          if [ -d "$NSIS_DIR" ]; then
+            for f in "$NSIS_DIR"/*.exe; do
+              [ -f "$f" ] && cp "$f" "release-assets/TOKENICODE-from-xtx_${VER}_x64-setup.exe"
+            done
+          fi
+
+          echo "--- release assets ---"
+          ls -lh release-assets/
+
+          # set output for empty check
+          COUNT=$(ls release-assets/ 2>/dev/null | wc -l)
+          echo "asset_count=$COUNT" >> $GITHUB_OUTPUT
+
+      # -- create release ---------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.release_name }}
+          body: |
+            ## 🔧 TOKENICODE from xtx — 自动构建
+
+            **版本**: `${{ steps.version.outputs.tag }}`
+            **平台**: Windows x64
+            **构建时间**: ${{ github.event.head_commit.timestamp || 'manual' }}
+
+            ### 📦 包含文件
+            - `TOKENICODE-from-xtx_*.exe` — 独立可执行文件 (22MB, 免安装直接运行)
+            - `TOKENICODE-from-xtx_*.msi` — Windows 安装包
+
+            > 🏷️ 此版本由 GitHub Actions 自动构建，from xtx。
+          draft: ${{ inputs.draft || false }}
+          prerelease: true
+          files: release-assets/*
+          fail_on_unmatched_files: ${{ steps.gather.outputs.asset_count != '0' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -- summary ----------------------------------------------------------
+      - name: Summary
+        shell: bash
+        run: |
+          echo "============================================"
+          echo "  Release: ${{ steps.version.outputs.release_name }}"
+          echo "  Tag:     ${{ steps.version.outputs.tag }}"
+          echo "  Assets:  $(ls release-assets/ | wc -l) files"
+          echo "============================================"
