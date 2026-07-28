@@ -1,0 +1,125 @@
+name: Build Windows EXE (from xtx)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. dev-1.0.6)"
+        required: false
+        default: "dev"
+        type: string
+  push:
+    branches:
+      - release-exe
+
+jobs:
+  build-windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Inject "from xtx" branding
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Patch productName and window title with "from xtx" branding
+          CONF="src-tauri/tauri.conf.json"
+          jq '.productName = "TOKENICODE-from-xtx"' "$CONF" > tmp.json && mv tmp.json "$CONF"
+          jq '.app.windows[0].title = "TOKENICODE from xtx"' "$CONF" > tmp.json && mv tmp.json "$CONF"
+          # Trim updater/createUpdaterArtifacts for dev builds (no signing)
+          jq 'del(.plugins.updater) | .bundle.createUpdaterArtifacts = false' "$CONF" > tmp.json && mv tmp.json "$CONF"
+          echo "=== patched tauri.conf.json ==="
+          cat "$CONF"
+
+      - name: Build Windows app
+        env:
+          EDITION: dev
+        run: pnpm tauri build --bundles msi
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          # Main .exe
+          EXE="src-tauri/target/release/tokenicode.exe"
+          if [ -f "$EXE" ]; then
+            cp "$EXE" "release-assets/TOKENICODE-from-xtx-standalone.exe"
+          fi
+
+          # MSI installer
+          MSI_DIR="src-tauri/target/release/bundle/msi"
+          if [ -d "$MSI_DIR" ]; then
+            find "$MSI_DIR" -name "*.msi" -print0 | while IFS= read -r -d '' msi; do
+              cp "$msi" "release-assets/$(basename "$msi")"
+            done
+          fi
+
+          echo "=== Release Assets ==="
+          ls -lh release-assets/
+
+      - name: Generate release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VER="${{ inputs.version }}"
+          else
+            VER="dev"
+          fi
+          TS="$(date -u +'%Y%m%d-%H%M%S')"
+          TAG="v${VER}-${TS}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "TOKENICODE from xtx — ${{ steps.tag.outputs.tag }}"
+          body: |
+            ## TOKENICODE from xtx — 独立可执行文件
+
+            > 🔧 自动构建版本，来自 **xtx**
+
+            ### 📦 包含文件
+            - **`TOKENICODE-from-xtx-standalone.exe`** — 独立可执行文件，双击即用
+            - **`TOKENICODE-from-xtx_*.msi`** — Windows 安装包
+
+            ### 🏷️ 版本信息
+            | 字段 | 值 |
+            |---|---|
+            | ProductName | `TOKENICODE-from-xtx` |
+            | 窗口标题 | `TOKENICODE from xtx` |
+
+            ---
+            *Built by GitHub Actions on ${{ github.ref_name }}*
+          draft: false
+          prerelease: true
+          files: release-assets/*
