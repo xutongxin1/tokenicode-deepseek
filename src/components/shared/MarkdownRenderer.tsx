@@ -28,16 +28,23 @@ function AsyncImage({ src, alt }: { src: string; alt?: string }) {
   const t = useT();
   const [dataUrl, setDataUrl] = useState<string | null>(null);
   const [error, setError] = useState(false);
+  const showThumbnails = useSettingsStore((s) => s.showImageThumbnails);
 
   useEffect(() => {
     const filePath = src.startsWith('file://') ? src.slice(7) : src;
     bridge.readFileBase64(filePath).then(setDataUrl).catch(() => setError(true));
   }, [src]);
 
-  const handleClick = useCallback(() => {
-    const filePath = src.startsWith('file://') ? src.slice(7) : src;
-    useLightboxStore.getState().openFile(filePath, alt);
-  }, [src, alt]);
+  const filePath = src.startsWith('file://') ? src.slice(7) : src;
+  const fileName = filePath.split(/[\\/]/).pop() || filePath;
+
+  const handleClick = useCallback((e: React.MouseEvent) => {
+    if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+      bridge.openWithDefaultApp(filePath);
+    } else {
+      useLightboxStore.getState().openFile(filePath, alt);
+    }
+  }, [filePath, alt]);
 
   if (error) {
     return (
@@ -71,6 +78,47 @@ function AsyncImage({ src, alt }: { src: string; alt?: string }) {
     );
   }
 
+  // Thumbnail mode: compact preview card
+  if (showThumbnails) {
+    return (
+      <div className="my-2 rounded-lg overflow-hidden border border-border-subtle
+        shadow-sm inline-block max-w-[240px] group cursor-pointer
+        hover:border-accent/40 hover:shadow-md transition-all duration-200"
+        onClick={handleClick}
+        title={t('msg.clickToEnlarge') + (useSettingsStore.getState().ctrlClickOpenExternally ? ' — ' + t('msg.ctrlClickToOpenExternally') : '')}
+      >
+        <div className="relative bg-bg-secondary/50">
+          <img
+            src={dataUrl}
+            alt={alt || ''}
+            className="w-full h-36 object-cover"
+          />
+          {/* Hover overlay */}
+          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20
+            transition-colors duration-200 flex items-center justify-center">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none"
+              stroke="white" strokeWidth="1.5"
+              className="opacity-0 group-hover:opacity-80 transition-opacity drop-shadow-sm">
+              <circle cx="8" cy="8" r="5" />
+              <path d="M12 12l5 5M8 5.5v5M5.5 8h5" />
+            </svg>
+          </div>
+        </div>
+        <div className="px-2.5 py-1.5 flex items-center gap-1.5">
+          <span className="text-[10px]">🖼️</span>
+          <span className="text-[11px] text-text-muted truncate flex-1">
+            {alt || fileName}
+          </span>
+          <span className="text-[10px] text-text-tertiary opacity-0
+            group-hover:opacity-100 transition-opacity">
+            {t('msg.clickToView')}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // Full-size mode (original behavior)
   return (
     <div className="my-3 rounded-xl overflow-hidden border border-border-subtle
       shadow-sm inline-block max-w-full">
@@ -464,7 +512,19 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
         const fileName = text.split(/[\\/]/).pop() || text;
         return (
           <button
-            onClick={() => useFileStore.getState().selectFile(resolved)}
+            onClick={(e) => {
+              if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+                bridge.openWithDefaultApp(resolved);
+              } else {
+                useFileStore.getState().selectFile(resolved);
+              }
+            }}
+            onContextMenu={(e) => {
+              if (e.ctrlKey || e.metaKey) {
+                e.preventDefault();
+                bridge.revealInFinder(resolved);
+              }
+            }}
             className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
               bg-accent/10 border border-accent/25 rounded-md
               text-xs text-accent font-medium cursor-pointer

@@ -4,6 +4,7 @@ import { useFileStore } from '../../stores/fileStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useLightboxStore } from '../shared/ImageLightbox';
 import { useT } from '../../lib/i18n';
+import { bridge } from '../../lib/tauri-bridge';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { CommandProcessingCard } from './CommandProcessingCard';
 import { PlanReviewCard } from './PlanReviewCard';
@@ -73,7 +74,20 @@ function renderCodeSegment(inner: string, key: number): ReactNode {
     return (
       <button
         key={key}
-        onClick={(e) => { e.stopPropagation(); useFileStore.getState().selectFile(resolved); }}
+        onClick={(e) => {
+          e.stopPropagation();
+          if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+            bridge.openWithDefaultApp(resolved);
+          } else {
+            useFileStore.getState().selectFile(resolved);
+          }
+        }}
+        onContextMenu={(e) => {
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            bridge.revealInFinder(resolved);
+          }
+        }}
         className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
           bg-white/15 border border-white/25 rounded-md
           text-xs font-medium cursor-pointer
@@ -171,11 +185,19 @@ function UserMsg({ message }: Props) {
             {attachments.map((att, i) => (
               <button
                 key={i}
-                onClick={() => {
-                  if (att.isImage) {
+                onClick={(e) => {
+                  if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+                    bridge.openWithDefaultApp(att.path);
+                  } else if (att.isImage) {
                     useLightboxStore.getState().openFile(att.path, att.name);
                   } else {
                     useFileStore.getState().selectFile(att.path);
+                  }
+                }}
+                onContextMenu={(e) => {
+                  if (e.ctrlKey || e.metaKey) {
+                    e.preventDefault();
+                    bridge.revealInFinder(att.path);
                   }
                 }}
                 className="inline-flex items-center gap-2 px-2.5 py-1.5
@@ -484,7 +506,7 @@ function ToolIcon({ name }: { name: string }) {
       );
     case 'Write':
       return (
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+        <svg width="14" height="14" viewBox="0 0 12 12" fill="none"
           stroke="currentColor" strokeWidth="1.2" className="text-accent/70 flex-shrink-0">
           <path d="M7 1H3a1 1 0 00-1 1v8a1 1 0 001 1h6a1 1 0 001-1V4L7 1z" />
           <path d="M7 1v3h3" />
@@ -493,7 +515,7 @@ function ToolIcon({ name }: { name: string }) {
       );
     case 'Edit':
       return (
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+        <svg width="14" height="14" viewBox="0 0 12 12" fill="none"
           stroke="currentColor" strokeWidth="1.2" className="text-accent/70 flex-shrink-0">
           <path d="M8.5 1.5l2 2-6.5 6.5H2V8L8.5 1.5z" />
           <path d="M7 3l2 2" />
@@ -558,6 +580,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const toolName = message.toolName || 'Tool';
   const label = getToolLabel(toolName, t);
   const input = message.toolInput;
+  const isFileEdit = toolName === 'Edit' || toolName === 'Write';
 
   // Compute diff stats for Edit tool
   const editDiff = toolName === 'Edit' ? computeEditDiff(input) : null;
@@ -581,10 +604,22 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
           <button
             onClick={(e) => {
               e.stopPropagation();
-              useFileStore.getState().selectFile(input.file_path);
+              if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+                bridge.openWithDefaultApp(input.file_path);
+              } else {
+                useFileStore.getState().selectFile(input.file_path);
+              }
             }}
-            className="text-[11px] text-accent/70 hover:text-accent font-mono
-              truncate max-w-[280px] hover:underline cursor-pointer transition-smooth"
+            onContextMenu={(e) => {
+              if (e.ctrlKey || e.metaKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                bridge.revealInFinder(input.file_path);
+              }
+            }}
+            className={`text-accent/70 hover:text-accent font-mono
+              truncate max-w-[280px] hover:underline cursor-pointer transition-smooth
+              ${isFileEdit ? 'text-[12px]' : 'text-[11px]'}`}
             title={input.file_path}
           >
             {shortPath(input.file_path)}
@@ -592,13 +627,13 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
           {/* Diff stats for Edit */}
           {editDiff && (
             <span className="inline-flex items-center gap-1 ml-0.5">
-              <span className="text-[10px] font-mono text-success">+{editDiff.added}</span>
-              <span className="text-[10px] font-mono text-error">-{editDiff.removed}</span>
+              <span className="text-[11px] font-mono text-success">+{editDiff.added}</span>
+              <span className="text-[11px] font-mono text-error">-{editDiff.removed}</span>
             </span>
           )}
           {/* Line count for Write */}
           {writeLines !== null && (
-            <span className="text-[10px] font-mono text-success ml-0.5">
+            <span className="text-[11px] font-mono text-success ml-0.5">
               +{writeLines} lines
             </span>
           )}
@@ -840,7 +875,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
           <span className="w-[10px] flex-shrink-0" />
         )}
         <ToolIcon name={toolName} />
-        <span className="text-xs font-medium text-text-muted">{label}</span>
+        <span className={`font-medium text-text-muted ${isFileEdit ? 'text-[13px]' : 'text-xs'}`}>{label}</span>
         {renderPreview()}
         {/* Show a small result indicator when collapsed with result */}
         {!expanded && hasResult && (
@@ -914,7 +949,7 @@ function ThinkingMsg({ message }: Props) {
   const t = useT();
   return (
     <div className="ml-11">
-      <details className="group">
+      <details open className="group">
         <summary className="flex items-center gap-1.5 py-1
           cursor-pointer text-[11px] text-text-tertiary list-none select-none">
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none"

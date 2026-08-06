@@ -2,23 +2,7 @@ import { useMemo } from 'react';
 import { SessionListItem } from '../../lib/tauri-bridge';
 import { SessionItem } from './SessionItem';
 import { useT } from '../../lib/i18n';
-
-/** Determine date category for a timestamp */
-function getDateCategory(ms: number): 'today' | 'yesterday' | 'thisWeek' | 'earlier' {
-  const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const yesterdayStart = todayStart - 86400000;
-
-  // Calculate start of current week (Monday)
-  const dayOfWeek = now.getDay();
-  const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-  const weekStart = todayStart - daysToMonday * 86400000;
-
-  if (ms >= todayStart) return 'today';
-  if (ms >= yesterdayStart) return 'yesterday';
-  if (ms >= weekStart) return 'thisWeek';
-  return 'earlier';
-}
+import { getDateCategory } from '../../lib/date-utils';
 
 interface SessionGroupProps {
   projectKey: string;
@@ -43,6 +27,7 @@ interface SessionGroupProps {
   onToggleCheck: (sessionId: string, shiftKey?: boolean) => void;
   renamingSessionId?: string | null;
   onRenameDone?: () => void;
+  highlightedSessionId?: string | null;
 }
 
 export function SessionGroup({
@@ -68,6 +53,7 @@ export function SessionGroup({
   onToggleCheck,
   renamingSessionId,
   onRenameDone,
+  highlightedSessionId,
 }: SessionGroupProps) {
   const t = useT();
 
@@ -186,6 +172,7 @@ export function SessionGroup({
                   onToggleCheck={onToggleCheck}
                   triggerRename={renamingSessionId === session.id}
                   onRenameDone={onRenameDone}
+                  isHighlighted={highlightedSessionId === session.id}
                 />
               ))}
               {dateGroups.length > 0 && (
@@ -219,6 +206,7 @@ export function SessionGroup({
                   onToggleCheck={onToggleCheck}
                   triggerRename={renamingSessionId === session.id}
                   onRenameDone={onRenameDone}
+                  isHighlighted={highlightedSessionId === session.id}
                 />
               ))}
             </div>

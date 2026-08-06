@@ -463,6 +463,19 @@ input, textarea, [contenteditable="true"],
   animation: title-update 0.5s ease-out;
 }
 
+/* Locate-in-folder highlight flash */
+@keyframes locate-flash {
+  0%, 100% { background-color: transparent; }
+  15% { background-color: rgba(99, 102, 241, 0.15); }
+  30% { background-color: transparent; }
+  45% { background-color: rgba(99, 102, 241, 0.1); }
+  60% { background-color: transparent; }
+}
+.locate-flash {
+  animation: locate-flash 2s ease-in-out;
+  border-radius: 0.5rem;
+}
+
 /* ================================================================
    Prose / Typography overrides — map to theme CSS vars
    ================================================================ */

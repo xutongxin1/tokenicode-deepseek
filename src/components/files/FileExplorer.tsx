@@ -102,11 +102,11 @@ function ContextMenu({ menu, onClose, callbacks }: {
       },
       'separator' as const,
     ] as MenuItem[] : []),
-    ...(!menu.isDir ? [{
+    {
       label: t('files.insertToChat'),
       icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M2 14l4-2 8-8-2-2-8 8-2 4z" /><path d="M10 4l2 2" /></svg>,
       action: () => { callbacks.onInsertToChat(menu.path); onClose(); },
-    }] as MenuItem[] : []),
+    },
     {
       label: t('files.copyPath'),
       icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M5 2H2v12h8v-3" /><path d="M6 6h8v8H6V6z" /></svg>,
@@ -246,7 +246,15 @@ function SearchResultItem({
   const isSelected = selectedFile === node.path;
   return (
     <button
-      onClick={() => { if (!node.is_dir) selectFile(node.path); }}
+      onClick={(e) => {
+        if (!node.is_dir) {
+          if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+            bridge.openWithDefaultApp(node.path);
+          } else {
+            selectFile(node.path);
+          }
+        }
+      }}
       onContextMenu={(e) => { e.preventDefault(); onContextMenu(e, node.path, node.is_dir); }}
       className={`w-full flex items-center gap-2 py-1.5 px-3 rounded-lg
         text-left text-[13px] transition-smooth group
@@ -314,11 +322,15 @@ function TreeNode({
 
   const isExpanded = expanded;
 
-  const handleClick = () => {
+  const handleClick = (e: React.MouseEvent) => {
     if (node.is_dir) {
       setExpanded(!expanded);
     } else {
-      selectFile(node.path);
+      if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+        bridge.openWithDefaultApp(node.path);
+      } else {
+        selectFile(node.path);
+      }
     }
   };
 
@@ -602,7 +614,7 @@ export function FileExplorer() {
     const tab = useChatStore.getState().getTab(tabId);
     const currentDraft = tab?.inputDraft ?? '';
     const prefix = currentDraft && !currentDraft.endsWith('\n') && !currentDraft.endsWith(' ') ? ' ' : '';
-    useChatStore.getState().setInputDraft(tabId, currentDraft + prefix + path);
+    useChatStore.getState().setInputDraft(tabId, currentDraft + prefix + '"' + path + '"');
   }, []);
 
   const handleNewFile = useCallback((dir: string) => {

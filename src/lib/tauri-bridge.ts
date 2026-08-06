@@ -318,6 +318,9 @@ export const bridge = {
   trackSession: (sessionId: string) =>
     invoke<void>('track_session', { sessionId }),
 
+  untrackSession: (sessionId: string) =>
+    invoke<void>('untrack_session', { sessionId }),
+
   deleteSession: (sessionId: string, sessionPath: string) =>
     invoke<void>('delete_session', { sessionId, sessionPath }),
 
@@ -332,6 +335,14 @@ export const bridge = {
 
   loadSession: (path: string) =>
     invoke<any[]>('load_session', { path }),
+
+  getSessionTokens: (sessionId: string) =>
+    invoke<{
+      totalInputTokens: number;
+      totalOutputTokens: number;
+      contextInputTokens: number;
+      contextOutputTokens: number;
+    }>('get_session_tokens', { sessionId }),
 
   openInVscode: (path: string) =>
     invoke<void>('open_in_vscode', { path }),
@@ -372,6 +383,11 @@ export const bridge = {
   getHomeDir: () =>
     invoke<string>('get_home_dir'),
 
+  /** Read absolute file paths from the system clipboard.
+   *  Windows CF_HDROP (files copied from Explorer); empty elsewhere. */
+  readClipboardFilePaths: () =>
+    invoke<string[]>('read_clipboard_file_paths'),
+
   exportSessionMarkdown: (path: string, outputPath: string, conversationOnly = false) =>
     invoke<void>('export_session_markdown', { path, outputPath, conversationOnly }),
 
@@ -405,8 +421,8 @@ export const bridge = {
     invoke<SlashCommand[]>('list_slash_commands', { cwd }),
 
   // Skills
-  listSkills: (cwd?: string) =>
-    invoke<SkillInfo[]>('list_skills', { cwd }),
+  listSkills: (cwd?: string, additionalDirs: string[] = []) =>
+    invoke<SkillInfo[]>('list_skills', { cwd, additionalDirs }),
 
   readSkill: (path: string) =>
     invoke<string>('read_skill', { path }),
@@ -434,9 +450,15 @@ export const bridge = {
   translateSkillMarkdown: (content: string, config: SkillTranslationConfig) =>
     invoke<string>('translate_skill_markdown', { content, config }),
 
+  loadSkillTranslationConfig: () =>
+    invoke<SkillTranslationConfig | null>('load_skill_translation_config'),
+
+  saveSkillTranslationConfig: (config: SkillTranslationConfig) =>
+    invoke<void>('save_skill_translation_config', { config }),
+
   // Unified commands (commands + skills)
-  listAllCommands: (cwd?: string) =>
-    invoke<UnifiedCommand[]>('list_all_commands', { cwd }),
+  listAllCommands: (cwd?: string, additionalDirs: string[] = []) =>
+    invoke<UnifiedCommand[]>('list_all_commands', { cwd, additionalDirs }),
 
   // Git commands (safe, allowlisted operations only)
   runGitCommand: (cwd: string, args: string[]) =>
@@ -543,6 +565,14 @@ export const bridge = {
   openTerminalLogin: () =>
     invoke<void>('open_terminal_login'),
 
+  /** Open a folder in the default terminal application (Windows Terminal on Windows) */
+  openFolderInTerminal: (path: string) =>
+    invoke<void>('open_folder_in_terminal', { path }),
+
+  /** Open a folder in terminal as Administrator (Windows only) */
+  openFolderInTerminalAdmin: (path: string) =>
+    invoke<void>('open_folder_in_terminal_admin', { path }),
+
   // Session custom names (persisted to ~/.claude/tokenicode_session_names.json)
   loadCustomPreviews: () =>
     invoke<Record<string, string>>('load_custom_previews'),
@@ -630,9 +660,19 @@ export function onClaudeStream(
   stdinId: string,
   callback: (message: any) => void,
 ): Promise<UnlistenFn> {
+  const channel = `claude:stream:${stdinId}`;
+  console.log('[bridge] registering stream listener:', channel);
   return listen<any>(
-    `claude:stream:${stdinId}`,
-    (event) => callback(event.payload),
+    channel,
+    (event) => {
+      // Diagnostic: log first event received to confirm the IPC bridge is working
+      if (!(window as any).__tcFirstEventLogged?.[stdinId]) {
+        if (!(window as any).__tcFirstEventLogged) (window as any).__tcFirstEventLogged = {};
+        (window as any).__tcFirstEventLogged[stdinId] = true;
+        console.log('[bridge] first stream event received on:', channel, 'type:', event.payload?.type);
+      }
+      callback(event.payload);
+    },
   );
 }
 

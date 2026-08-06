@@ -13,6 +13,7 @@ import {
   getContextWindowForModel,
   getAutoCompactThreshold,
 } from '../../stores/settingsStore';
+import { getContextUsedTokens } from '../../lib/context-usage';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useAgentStore } from '../../stores/agentStore';
@@ -25,7 +26,7 @@ import { useProviderStore } from '../../stores/providerStore';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { SetupWizard } from '../setup/SetupWizard';
 import { AiAvatar } from '../shared/AiAvatar';
-import { displayDeepSeekModelName } from '../../lib/deepseek-models';
+import { displayProviderModelName } from '../../lib/deepseek-models';
 import { parseTurns, type Turn } from '../../lib/turns';
 
 /** Shared plan panel toggle — used by ChatPanel (panel) and InputBar (button) */
@@ -135,8 +136,8 @@ function PlanPanel({ planMessages, onClose }: {
 
 /** Map raw model ID to friendly display name */
 function getModelDisplayName(modelId: string): string {
-  const option = MODEL_OPTIONS.find((m) => modelId.includes(m.id));
-  return option?.short || displayDeepSeekModelName(modelId);
+  const option = MODEL_OPTIONS.find((m) => modelId === m.id);
+  return option?.short || displayProviderModelName(modelId);
 }
 
 
@@ -156,7 +157,7 @@ function formatElapsed(ms: number): string {
 }
 
 /** Cycling typewriter text for thinking phase — like Claude Code website "Built for > coders" */
-const THINKING_WORD_COUNT = 17;
+const THINKING_WORD_COUNT = 5;
 const TYPING_SPEED = 80;      // ms per character (typing)
 const DELETING_SPEED = 40;    // ms per character (deleting)
 const PAUSE_DURATION = 2500;  // ms to hold full word
@@ -236,6 +237,7 @@ function ActivityIndicator({ activityStatus, sessionMeta }: {
     turnStartTime?: number;
     outputTokens?: number;
     inputTokens?: number;
+    contextInputTokens?: number;
     lastProgressAt?: number;
     spawnedModel?: string;
     snapshotModel?: string;
@@ -273,7 +275,7 @@ function ActivityIndicator({ activityStatus, sessionMeta }: {
     resolvedModel,
     sessionMeta.snapshotContextWindowMode ?? contextWindowMode,
   );
-  const inputTokens = sessionMeta.inputTokens || 0;
+  const inputTokens = sessionMeta.contextInputTokens ?? sessionMeta.inputTokens ?? 0;
   const contextWarning = inputTokens > contextWindow * 0.6;
 
   // Stall detection: 120s of silence (no stream activity), not total elapsed time.
@@ -330,9 +332,7 @@ function ContextMeter({ sessionMeta, tabId, sessionStatus }: {
   const effectiveContextMode = sessionMeta.snapshotContextWindowMode ?? contextWindowMode;
   const contextWindow = getContextWindowForModel(modelForContext, effectiveContextMode);
   const compactThreshold = getAutoCompactThreshold(modelForContext, effectiveContextMode, autoCompactThresholdTokens);
-  const used = Math.min(contextWindow, Math.max(0,
-    (sessionMeta.inputTokens ?? 0) + (sessionMeta.outputTokens ?? 0),
-  ));
+  const used = Math.min(contextWindow, getContextUsedTokens(sessionMeta));
   const available = Math.max(0, contextWindow - used);
   const percent = Math.min(100, Math.round((used / contextWindow) * 100));
   const thresholdPercent = Math.min(100, Math.round((compactThreshold / contextWindow) * 100));
@@ -372,7 +372,7 @@ function ContextMeter({ sessionMeta, tabId, sessionStatus }: {
   return (
     <div className="hidden md:flex items-center gap-2 ml-2 px-2 py-1 rounded-lg
       bg-bg-secondary/60 border border-border-subtle text-[10px] text-text-tertiary"
-      title={`Actual model: ${displayDeepSeekModelName(modelForContext)}; context used ${used.toLocaleString()} / ${contextWindow.toLocaleString()}; available ${available.toLocaleString()}; auto compact at ${compactThreshold.toLocaleString()}`}>
+      title={`Actual model: ${displayProviderModelName(modelForContext)}; context used ${used.toLocaleString()} / ${contextWindow.toLocaleString()}; available ${available.toLocaleString()}; auto compact at ${compactThreshold.toLocaleString()}`}>
       <span className="font-medium text-text-muted">Ctx</span>
       <div className="w-20 h-1.5 rounded-full bg-bg-tertiary overflow-hidden">
         <div
@@ -648,6 +648,40 @@ export function ChatPanel() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, partialText, partialThinking]);
+
+  // Force scroll to bottom when streaming ends. The streamed block is removed
+  // and the final assistant message is committed in SEPARATE Zustand updates
+  // (each setState re-renders synchronously), so on the isStreaming flip the
+  // message list is still missing the final answer — scrolling immediately
+  // pins the viewport to the last user question once the answer is appended.
+  // Defer to rAF so the scroll happens after the commit render lands and
+  // scrollHeight reflects the final message. Dependencies MUST stay [isStreaming]
+  // only: the commit render would re-run this effect and its cleanup would
+  // cancelAnimationFrame the pending scroll before it ever fires.
+  const wasStreamingRef = useRef(false);
+  useEffect(() => {
+    if (isStreaming) {
+      wasStreamingRef.current = true;
+      return;
+    }
+    if (!wasStreamingRef.current) return;
+    wasStreamingRef.current = false;
+    const raf = requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+      // Extremely defensive: if content is still growing (message commit
+      // landed after this frame), retry once on the next frame.
+      if (el.scrollHeight - el.scrollTop - el.clientHeight > 2) {
+        requestAnimationFrame(() => {
+          if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        });
+      }
+      userScrollingUpRef.current = false;
+      isNearBottomRef.current = true;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [isStreaming]);
 
   useEffect(() => {
     updateActiveTurnFromScroll();

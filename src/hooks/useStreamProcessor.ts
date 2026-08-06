@@ -14,6 +14,13 @@ import { bridge, onClaudeStream, onClaudeStderr } from '../lib/tauri-bridge';
 import { envFingerprint, resolveModelForProvider, resolveThinkingLevelForProvider } from '../lib/api-provider';
 import { useProviderStore } from '../stores/providerStore';
 import { t } from '../lib/i18n';
+import {
+  getContextInputTokens,
+  getContextOutputTokens,
+  getContextUsedTokens,
+  hasMeaningfulContextUsage,
+  type TokenUsage,
+} from '../lib/context-usage';
 
 // --- Error classification for user-facing messages ---
 // Each pattern maps to a friendly i18n key. Matched errors show the friendly
@@ -37,6 +44,63 @@ export function formatErrorForUser(raw: string): string {
   const match = ERROR_CATEGORIES.find((c) => c.pattern.test(raw));
   const friendly = match ? t(match.i18nKey) : t('error.genericFallback');
   return `${friendly}\n\n<details>\n<summary>${t('error.showDetails')}</summary>\n\n\`\`\`\n${raw}\n\`\`\`\n\n</details>`;
+}
+
+// --- Token state cache + Claude UUID index (survives F5 via sessionStorage) ---
+// Token persistence: real-time cache for F5 recovery during active streaming.
+// UUID index: maps tabId → Claude session UUID for JSONL cross-check on reconnect.
+
+const TOKEN_STATE_KEY = 'tokenicode_token_state_v2';
+const UUID_INDEX_KEY = 'tokenicode_claude_uuids';
+
+function _persistTokenState(tabId: string, meta: {
+  inputTokens?: number;
+  outputTokens?: number;
+  contextInputTokens?: number;
+  contextOutputTokens?: number;
+  totalInputTokens?: number;
+  totalOutputTokens?: number;
+}) {
+  try {
+    const data = JSON.parse(sessionStorage.getItem(TOKEN_STATE_KEY) || '{}');
+    data[tabId] = {
+      inputTokens: meta.inputTokens,
+      outputTokens: meta.outputTokens,
+      contextInputTokens: meta.contextInputTokens,
+      contextOutputTokens: meta.contextOutputTokens,
+      totalInputTokens: meta.totalInputTokens,
+      totalOutputTokens: meta.totalOutputTokens,
+    };
+    sessionStorage.setItem(TOKEN_STATE_KEY, JSON.stringify(data));
+  } catch {/* ignore */}
+}
+
+function contextSnapshot(usage: TokenUsage | undefined): {
+  contextInputTokens: number;
+  contextOutputTokens: number;
+} | null {
+  if (!hasMeaningfulContextUsage(usage)) return null;
+  return {
+    contextInputTokens: getContextInputTokens(usage),
+    contextOutputTokens: getContextOutputTokens(usage),
+  };
+}
+
+function _persistClaudeUuid(tabId: string, claudeUuid: string) {
+  try {
+    const data = JSON.parse(sessionStorage.getItem(UUID_INDEX_KEY) || '{}');
+    data[tabId] = claudeUuid;
+    sessionStorage.setItem(UUID_INDEX_KEY, JSON.stringify(data));
+  } catch {/* ignore */}
+}
+
+export function loadClaudeUuid(tabId: string): string | null {
+  try {
+    const data = JSON.parse(sessionStorage.getItem(UUID_INDEX_KEY) || '{}');
+    return data[tabId] || null;
+  } catch {
+    return null;
+  }
 }
 
 // --- Streaming text buffer (rAF-throttled + interval fallback, per-stdinId) ---
@@ -96,6 +160,14 @@ function _doFlush(stdinId: string, buf: _StreamBuffer) {
     useSessionStore.getState().registerStdinTab(stdinId, tabId);
   }
   if (!tabId) {
+    // No active tab to render into — the selectedSessionId is likely null
+    // (e.g. app just launched, no tab selected yet). Log and discard buffered
+    // text so stale data won't be flushed to the wrong tab later.
+    console.warn('[stream-flush] no tabId for stdinId:', stdinId,
+      'mappedId:', mappedId,
+      'selectedSessionId:', useSessionStore.getState().selectedSessionId,
+      'dropping text:', buf.text.slice(0, 80),
+      'dropping thinking:', buf.thinking.slice(0, 80));
     buf.text = '';
     buf.thinking = '';
     return;
@@ -150,6 +222,40 @@ export function flushStreamBuffer(stdinId?: string) {
     clearInterval(_flushIntervalId);
     _flushIntervalId = null;
   }
+}
+
+/** Preserve streamed text when a provider omits the final full assistant event. */
+function commitPartialText(tabId: string, stdinId?: string): boolean {
+  flushStreamBuffer(stdinId);
+  const store = useChatStore.getState();
+  const tab = store.getTab(tabId);
+  const content = tab?.partialText?.trim();
+  if (!content) return false;
+
+  const alreadyPresent = tab?.messages.some(
+    (message) => message.role === 'assistant'
+      && message.type === 'text'
+      && message.content.trim() === content,
+  );
+  if (!alreadyPresent) {
+    store.addMessage(tabId, {
+      id: generateMessageId(),
+      role: 'assistant',
+      type: 'text',
+      content,
+      timestamp: Date.now(),
+    });
+  }
+  return true;
+}
+
+export function hasAssistantReplyForTurn(messages: ChatMessage[], turnStartTime: number): boolean {
+  return messages.some(
+    (message) => message.role === 'assistant'
+      && message.type === 'text'
+      && !!message.content.trim()
+      && message.timestamp >= turnStartTime,
+  );
 }
 
 // --- File tree auto-refresh on file-mutating tool completions ---
@@ -378,13 +484,17 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           }
         }
         // Track tokens in background sessions (per-turn + cumulative total)
-        if (evt.type === 'message_start' && evt.message?.usage?.input_tokens) {
+        if (evt.type === 'message_start' && evt.message?.usage) {
           const bgTab = store.getTab(tabId);
-          const delta = evt.message.usage.input_tokens;
+          const delta = evt.message.usage.input_tokens || 0;
+          const snapshot = contextSnapshot(evt.message.usage);
           store.setSessionMeta(tabId, {
             inputTokens: (bgTab?.sessionMeta.inputTokens || 0) + delta,
             totalInputTokens: (bgTab?.sessionMeta.totalInputTokens || 0) + delta,
+            ...(snapshot ? { ...snapshot, contextOutputTokens: 0 } : {}),
           });
+          const updatedMeta = store.getTab(tabId)?.sessionMeta;
+          if (updatedMeta) _persistTokenState(tabId, updatedMeta);
         }
         if (evt.type === 'message_delta' && evt.usage?.output_tokens) {
           const bgTab = store.getTab(tabId);
@@ -392,7 +502,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           store.setSessionMeta(tabId, {
             outputTokens: (bgTab?.sessionMeta.outputTokens || 0) + delta,
             totalOutputTokens: (bgTab?.sessionMeta.totalOutputTokens || 0) + delta,
+            contextOutputTokens: getContextOutputTokens(evt.usage),
           });
+          const updatedMeta2 = store.getTab(tabId)?.sessionMeta;
+          if (updatedMeta2) _persistTokenState(tabId, updatedMeta2);
         }
         break;
       }
@@ -557,6 +670,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'result': {
+        commitPartialText(tabId, msg.__stdinId);
         store.setSessionStatus(tabId, msg.subtype === 'success' ? 'completed' : 'error');
         {
           const bgTab = store.getTab(tabId);
@@ -576,6 +690,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             turnStartTime: undefined,
             lastProgressAt: undefined,
           });
+          // Persist final token state for F5 recovery (background tab)
+          const bgResultMeta = store.getTab(tabId)?.sessionMeta;
+          if (bgResultMeta) _persistTokenState(tabId, bgResultMeta);
         }
         if (typeof msg.result === 'string' && msg.result) {
           // Only add if not already delivered via 'assistant' event
@@ -666,8 +783,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'process_exit': {
-        // Flush any remaining stream buffer before cleanup (#64)
-        flushStreamBuffer(msg.__stdinId);
+        // Preserve delta-only replies before status cleanup clears partialText.
+        commitPartialText(tabId, msg.__stdinId);
 
         // P0-5: Clean up Tauri event listeners for background tab.
         // __claudeUnlisteners is keyed by stdinId (desk_xxx), NOT tabId (session uuid).
@@ -908,6 +1025,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       if (currentId !== cliSessionId) {
         setSessionMeta({ sessionId: cliSessionId });
         bridge.trackSession(cliSessionId).catch(() => {});
+        // Persist Claude session UUID for F5 recovery (token totals read from JSONL)
+        _persistClaudeUuid(tabId, cliSessionId);
 
         // Promote draft tab to real session ID so it merges with disk session
         if (tabId.startsWith('draft_')) {
@@ -921,6 +1040,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             useChatStore.setState({ tabs: newTabs, sessionCache: newTabs });
           }
           useSessionStore.getState().promoteDraft(tabId, cliSessionId);
+          // Update UUID index: tab key changed from draft_* to the real UUID
+          _persistClaudeUuid(cliSessionId, cliSessionId);
         }
 
         useSessionStore.getState().fetchSessions();
@@ -1038,13 +1159,17 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
 
         // Track input tokens from message_start (per-turn + cumulative total)
-        if (evt.type === 'message_start' && evt.message?.usage?.input_tokens) {
+        if (evt.type === 'message_start' && evt.message?.usage) {
           const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
-          const delta = evt.message.usage.input_tokens;
+          const delta = evt.message.usage.input_tokens || 0;
+          const snapshot = contextSnapshot(evt.message.usage);
           setSessionMeta({
             inputTokens: (meta.inputTokens || 0) + delta,
             totalInputTokens: (meta.totalInputTokens || 0) + delta,
+            ...(snapshot ? { ...snapshot, contextOutputTokens: 0 } : {}),
           });
+          const updatedMeta = useChatStore.getState().getTab(tabId)?.sessionMeta;
+          if (updatedMeta) _persistTokenState(tabId, updatedMeta);
         }
 
         // Track output tokens from message_delta (per-turn + cumulative total)
@@ -1054,7 +1179,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           setSessionMeta({
             outputTokens: (meta.outputTokens || 0) + delta,
             totalOutputTokens: (meta.totalOutputTokens || 0) + delta,
+            contextOutputTokens: getContextOutputTokens(evt.usage),
           });
+          const updatedMeta2 = useChatStore.getState().getTab(tabId)?.sessionMeta;
+          if (updatedMeta2) _persistTokenState(tabId, updatedMeta2);
         }
         break;
       }
@@ -1072,6 +1200,20 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             content: formatErrorForUser(rawError),
             timestamp: Date.now(),
           });
+        } else if (msg.subtype === 'thinking_tokens') {
+          // Track estimated thinking token usage (Claude CLI stream-json)
+          // Updates sessionMeta with thinking token estimates for display
+          const thinkingTokens = msg.estimated_tokens;
+          if (typeof thinkingTokens === 'number') {
+            const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
+            setSessionMeta({
+              thinkingTokens,
+              totalThinkingTokens: (meta.totalThinkingTokens || 0) + (msg.estimated_tokens_delta || 0),
+            });
+          }
+        } else if (msg.subtype === 'status') {
+          // Session status updates (e.g. "requesting") — informational, silently tracked
+          // We don't surface these as user-visible messages; they're internal CLI state
         } else {
           // FI-3: Log unknown subtypes so we know what we're missing
           console.warn('[TOKENICODE] Unhandled system subtype:', msg.subtype, msg);
@@ -1454,7 +1596,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           break;
         }
 
-        // Clear any remaining partial text before marking turn complete
+        // Preserve delta-only replies before clearing streaming state.
+        commitPartialText(tabId, msgStdinId);
         clearPartial();
 
         // --- TK-303: Auto-retry on thinking signature error after provider/model switch ---
@@ -1715,6 +1858,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             turnStartTime: undefined,
             lastProgressAt: undefined,
           });
+          // Persist final token state for F5 recovery
+          const resultMeta = useChatStore.getState().getTab(tabId)?.sessionMeta;
+          if (resultMeta) _persistTokenState(tabId, resultMeta);
         }
         agentActions.completeAll(
           msg.subtype === 'success' ? 'completed' : 'error'
@@ -1757,8 +1903,13 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // --- Auto-compact: threshold follows the declared context window.
         // Default 200K models compact at 160K; declared 1M models compact at 800K.
         // Fires at most once per session to avoid infinite loops.
-        const resultInputTokens = msg.usage?.input_tokens || 0;
         const compactMeta = useChatStore.getState().getTab(tabId)?.sessionMeta;
+        const resultContextTokens = getContextUsedTokens({
+          inputTokens: msg.usage?.input_tokens,
+          outputTokens: msg.usage?.output_tokens,
+          contextInputTokens: compactMeta?.contextInputTokens,
+          contextOutputTokens: compactMeta?.contextOutputTokens,
+        });
         const compactStdinId = compactMeta?.stdinId;
         const compactModel = compactMeta?.spawnedModel || compactMeta?.snapshotModel || useSettingsStore.getState().selectedModel;
         const compactMode = compactMeta?.snapshotContextWindowMode ?? useSettingsStore.getState().contextWindowMode;
@@ -1767,9 +1918,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           compactMode,
           useSettingsStore.getState().autoCompactThresholdTokens,
         );
-        if (resultInputTokens > autoCompactThreshold && !autoCompactFiredRef.current && compactStdinId && msg.subtype === 'success') {
+        if (resultContextTokens > autoCompactThreshold && !autoCompactFiredRef.current && compactStdinId && msg.subtype === 'success') {
           autoCompactFiredRef.current = true;
-          console.log('[TOKENICODE] Auto-compact triggered:', { inputTokens: resultInputTokens, threshold: autoCompactThreshold });
+          console.log('[TOKENICODE] Auto-compact triggered:', { contextTokens: resultContextTokens, threshold: autoCompactThreshold });
           const compactMsgId = generateMessageId();
           addMessage({
             id: compactMsgId,
@@ -1876,6 +2027,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
       case 'process_exit': {
         // The CLI process has exited — clear the stdin handle but keep sessionId for resume
+        commitPartialText(tabId, msgStdinId);
         clearPartial();
         console.log('[TOKENICODE:session] process_exit received', { stdinId: msg.__stdinId });
 
@@ -1886,15 +2038,14 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           useChatStore.getState().setSessionMeta(tabId, { pendingCommandMsgId: undefined });
         }
 
-        // If the session was running and no assistant messages were received,
-        // the process failed at startup. Show the last stderr error to the user.
+        // Check this turn only. Old assistant messages must not hide a failed
+        // follow-up that exited without returning any text.
         const exitTabData = useChatStore.getState().getTab(tabId);
         const exitStatus = exitTabData?.sessionStatus;
         const exitMsgs = exitTabData?.messages ?? [];
         if (exitStatus === 'running') {
-          const hasAssistantReply = exitMsgs.some(
-            (m: ChatMessage) => m.role === 'assistant' && (m.type === 'text' || m.type === 'tool_use'),
-          );
+          const turnStartTime = exitTabData?.sessionMeta.turnStartTime ?? 0;
+          const hasAssistantReply = hasAssistantReplyForTurn(exitMsgs, turnStartTime);
           if (!hasAssistantReply) {
             if (lastStderrRef.current) {
               // Detect macOS TCC permission errors and provide actionable guidance

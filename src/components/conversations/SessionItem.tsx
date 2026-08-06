@@ -66,6 +66,7 @@ interface SessionItemProps {
   searchQuery?: string;
   triggerRename?: boolean;
   onRenameDone?: () => void;
+  isHighlighted?: boolean;
 }
 
 export const SessionItem = memo(function SessionItem({
@@ -87,6 +88,7 @@ export const SessionItem = memo(function SessionItem({
   onToggleCheck,
   triggerRename,
   onRenameDone,
+  isHighlighted,
 }: SessionItemProps) {
   const t = useT();
   const [isRenaming, setIsRenaming] = useState(false);
@@ -160,6 +162,7 @@ export const SessionItem = memo(function SessionItem({
       className={`w-full text-left pl-7 pr-3 py-1.5 rounded-xl
         transition-smooth group conversation-list-item
         ${isArchived ? 'opacity-50' : ''}
+        ${isHighlighted ? 'locate-flash' : ''}
         ${isSelected
           ? 'bg-accent/10 ring-1 ring-accent/20'
           : 'hover:bg-bg-secondary'

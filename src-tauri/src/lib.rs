@@ -74,10 +74,16 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Manages active file watchers
+/// Holds a watcher and its background flush task; dropping stops both.
+struct WatchHandle {
+    _watcher: notify::RecommendedWatcher,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Manages active file watchers with debounced event batching
 #[derive(Default)]
 struct WatcherManager {
-    watchers: Arc<TokioMutex<HashMap<String, notify::RecommendedWatcher>>>,
+    watchers: Arc<TokioMutex<HashMap<String, WatchHandle>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -345,21 +351,21 @@ fn system_proxy_url() -> Option<String> {
     if is_enabled("HTTPSEnable") {
         if let (Some(host), Some(port)) = (get_val("HTTPSProxy"), get_val("HTTPSPort")) {
             let url = format!("http://{}:{}", host, port);
-            eprintln!("system proxy detected (HTTPS): {}", url);
+            eprintln!("system HTTPS proxy detected");
             return Some(url);
         }
     }
     if is_enabled("SOCKSEnable") {
         if let (Some(host), Some(port)) = (get_val("SOCKSProxy"), get_val("SOCKSPort")) {
             let url = format!("socks5://{}:{}", host, port);
-            eprintln!("system proxy detected (SOCKS): {}", url);
+            eprintln!("system SOCKS proxy detected");
             return Some(url);
         }
     }
     if is_enabled("HTTPEnable") {
         if let (Some(host), Some(port)) = (get_val("HTTPProxy"), get_val("HTTPPort")) {
             let url = format!("http://{}:{}", host, port);
-            eprintln!("system proxy detected (HTTP): {}", url);
+            eprintln!("system HTTP proxy detected");
             return Some(url);
         }
     }
@@ -385,7 +391,7 @@ fn probe_local_proxy() -> Option<String> {
         .is_ok()
         {
             let url = format!("{}://127.0.0.1:{}", scheme, port);
-            eprintln!("auto-detected local proxy: {}", url);
+            eprintln!("auto-detected local proxy");
             return Some(url);
         }
     }
@@ -502,14 +508,11 @@ async fn build_smart_http_client(
     if let Some(proxy_url) = resolve_proxy_url() {
         if is_proxy_reachable(&proxy_url).await {
             if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
-                eprintln!("Smart proxy: using proxy {}", proxy_url);
+                eprintln!("Smart proxy: using configured proxy");
                 builder = builder.proxy(proxy);
             }
         } else {
-            eprintln!(
-                "Smart proxy: proxy {} unreachable, connecting directly",
-                proxy_url
-            );
+            eprintln!("Smart proxy: configured proxy unreachable, connecting directly");
         }
     }
 
@@ -854,13 +857,10 @@ fn providers_path() -> Result<std::path::PathBuf, String> {
 }
 
 // --- Provider credential encryption (TK-303) ---
-// The master key lives in safe_data_dir()/providers.key — the SAME user-home
-// directory as providers.json. That directory SURVIVES app updates (the NSIS
-// installer and the Tauri updater only replace the binary, never the home data
-// dir), so the key is always present after an update and decryption can never
-// fail due to an update. Cross-device sync is preserved: load/save encrypt and
-// decrypt transparently, while export/import operate on the in-memory plaintext
-// provider (so the exported JSON stays portable across machines).
+// Provider JSON is AES-GCM encrypted with a persistent random master key. On
+// Windows that key is sealed with DPAPI for the current OS user; legacy raw key
+// files are migrated on load. Unix builds retain owner-only file permissions.
+// Export/import still operates on explicit user-requested plaintext JSON.
 
 use rand::RngCore;
 use base64::Engine;
@@ -868,6 +868,103 @@ use base64::Engine;
 const ENC_MAGIC: &str = "TENC1:";
 const PROVIDER_KEY_FILE: &str = "providers.key";
 const MASTER_KEY_LEN: usize = 32;
+#[cfg(target_os = "windows")]
+const DPAPI_MAGIC: &[u8] = b"TDP1";
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct DataBlob {
+    cb_data: u32,
+    pb_data: *mut u8,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "Crypt32")]
+unsafe extern "system" {
+    fn CryptProtectData(
+        data_in: *const DataBlob,
+        description: *const u16,
+        optional_entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *const std::ffi::c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
+    fn CryptUnprotectData(
+        data_in: *const DataBlob,
+        description: *mut *mut u16,
+        optional_entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *const std::ffi::c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+fn dpapi_transform(input: &[u8], protect: bool) -> Result<Vec<u8>, String> {
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+    let input_blob = DataBlob {
+        cb_data: input.len() as u32,
+        pb_data: input.as_ptr() as *mut u8,
+    };
+    let mut output_blob = DataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+    let ok = unsafe {
+        if protect {
+            CryptProtectData(
+                &input_blob, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
+                std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output_blob,
+            )
+        } else {
+            CryptUnprotectData(
+                &input_blob, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
+                std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output_blob,
+            )
+        }
+    };
+    if ok == 0 || output_blob.pb_data.is_null() {
+        return Err("Windows credential protection failed".to_string());
+    }
+    let output = unsafe {
+        let value = std::slice::from_raw_parts(output_blob.pb_data, output_blob.cb_data as usize).to_vec();
+        let _ = LocalFree(output_blob.pb_data as *mut std::ffi::c_void);
+        value
+    };
+    Ok(output)
+}
+
+#[cfg(target_os = "windows")]
+fn seal_master_key(key: &[u8; MASTER_KEY_LEN]) -> Result<Vec<u8>, String> {
+    let mut stored = DPAPI_MAGIC.to_vec();
+    stored.extend_from_slice(&dpapi_transform(key, true)?);
+    Ok(stored)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn seal_master_key(key: &[u8; MASTER_KEY_LEN]) -> Result<Vec<u8>, String> {
+    Ok(key.to_vec())
+}
+
+#[cfg(target_os = "windows")]
+fn open_master_key(raw: &[u8]) -> Result<[u8; MASTER_KEY_LEN], String> {
+    let plain = if raw.starts_with(DPAPI_MAGIC) {
+        dpapi_transform(&raw[DPAPI_MAGIC.len()..], false)?
+    } else {
+        raw.to_vec()
+    };
+    plain.try_into().map_err(|_| "Invalid provider master key".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_master_key(raw: &[u8]) -> Result<[u8; MASTER_KEY_LEN], String> {
+    raw.try_into().map_err(|_| "Invalid provider master key".to_string())
+}
 
 #[cfg(unix)]
 fn harden_path_permissions(path: &std::path::Path) {
@@ -887,11 +984,12 @@ fn load_or_create_master_key() -> Result<[u8; MASTER_KEY_LEN], String> {
     let path = provider_key_path()?;
     if path.exists() {
         let raw = std::fs::read(&path).map_err(|e| format!("读取密钥失败: {}", e))?;
-        if raw.len() != MASTER_KEY_LEN {
-            return Err("主密钥文件损坏".to_string());
+        let key = open_master_key(&raw)?;
+        #[cfg(target_os = "windows")]
+        if !raw.starts_with(DPAPI_MAGIC) {
+            std::fs::write(&path, seal_master_key(&key)?)
+                .map_err(|e| format!("Failed to migrate provider key protection: {}", e))?;
         }
-        let mut key = [0u8; MASTER_KEY_LEN];
-        key.copy_from_slice(&raw);
         return Ok(key);
     }
     let mut key = [0u8; MASTER_KEY_LEN];
@@ -899,7 +997,8 @@ fn load_or_create_master_key() -> Result<[u8; MASTER_KEY_LEN], String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {}", e))?;
     }
-    std::fs::write(&path, &key).map_err(|e| format!("写入密钥失败: {}", e))?;
+    std::fs::write(&path, seal_master_key(&key)?)
+        .map_err(|e| format!("写入密钥失败: {}", e))?;
     harden_path_permissions(&path);
     Ok(key)
 }
@@ -1019,7 +1118,7 @@ async fn test_provider_connection(
         if !purl.is_empty() {
             if let Ok(proxy) = reqwest::Proxy::all(purl) {
                 if is_proxy_reachable(purl).await {
-                    eprintln!("test_provider_connection: using provider proxy {}", purl);
+                    eprintln!("test_provider_connection: using configured provider proxy");
                     reqwest::Client::builder()
                         .connect_timeout(std::time::Duration::from_secs(10))
                         .timeout(std::time::Duration::from_secs(30))
@@ -1028,7 +1127,7 @@ async fn test_provider_connection(
                         .build()
                         .unwrap_or_default()
                 } else {
-                    eprintln!("test_provider_connection: provider proxy {} unreachable, direct", purl);
+                    eprintln!("test_provider_connection: configured provider proxy unreachable, direct");
                     build_smart_http_client(
                         std::time::Duration::from_secs(10),
                         std::time::Duration::from_secs(30),
@@ -1630,9 +1729,13 @@ async fn start_claude_session(
         "[TOKENICODE] CLI spawned: pid={}, bin={}, permission_mode={}",
         pid, claude_bin, permission_mode
     );
-    eprintln!("[TOKENICODE] args: {:?}", &args);
-    eprintln!("[TOKENICODE] PATH: {}", &enriched_path);
-    eprintln!("[TOKENICODE] resolved_env: {:?}", &resolved_env);
+    // Never log subprocess arguments, PATH, or environment values: provider
+    // API keys and proxy credentials may be present in those values.
+    eprintln!(
+        "[TOKENICODE] runtime config: args={}, env_keys={}",
+        args.len(),
+        resolved_env.len()
+    );
     eprintln!("[TOKENICODE] cwd: {}", &params.cwd);
 
     // Capture stdin and store in StdinManager for sending follow-up messages
@@ -1690,30 +1793,23 @@ async fn start_claude_session(
                 }
             };
             line_count += 1;
-            // Log first 10 lines with timing to diagnose startup delay
-            if line_count <= 10 {
-                let elapsed = spawn_time.elapsed().as_millis();
-                let preview = if line.len() > 150 {
-                    &line[..150]
-                } else {
-                    &line
-                };
-                eprintln!(
-                    "[TOKENICODE:stdout] #{} @{}ms type={} preview={}",
-                    line_count,
-                    elapsed,
-                    serde_json::from_str::<Value>(&line)
-                        .ok()
-                        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
-                        .unwrap_or_else(|| "?".into()),
-                    preview
-                );
-            }
             // Parse every line as a JSON Value first (avoids serde enum pitfalls)
             let json = match serde_json::from_str::<Value>(&line) {
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
+            // Keep startup diagnostics without persisting prompts, responses,
+            // thinking text, tool input, or other user data in application logs.
+            if line_count <= 10 {
+                eprintln!(
+                    "[TOKENICODE:stdout] #{} @{}ms type={} subtype={} bytes={}",
+                    line_count,
+                    spawn_time.elapsed().as_millis(),
+                    json.get("type").and_then(|v| v.as_str()).unwrap_or("?"),
+                    json.get("subtype").and_then(|v| v.as_str()).unwrap_or("-"),
+                    line.len(),
+                );
+            }
 
             // Intercept control_request messages for SDK control protocol routing.
             // All modes use --permission-prompt-tool stdio. In bypass mode, we
@@ -2178,6 +2274,29 @@ async fn track_session(session_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Hide a superseded session from TOKENICODE without deleting its JSONL file.
+/// Rewind uses this to replace the visible branch while keeping recovery data.
+#[tauri::command]
+async fn untrack_session(session_id: String) -> Result<(), String> {
+    let path = tracked_sessions_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    use std::io::BufRead;
+    let contents: Vec<String> = std::io::BufReader::new(
+        std::fs::File::open(&path).map_err(|e| format!("Failed to read tracked sessions: {}", e))?,
+    )
+    .lines()
+    .flatten()
+    .filter(|line| line.trim() != session_id)
+    .collect();
+    let tmp = path.with_extension("txt.tmp");
+    let body = if contents.is_empty() { String::new() } else { contents.join("\n") + "\n" };
+    std::fs::write(&tmp, body).map_err(|e| format!("Failed to write tracked sessions: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename tracked sessions: {}", e))?;
+    Ok(())
+}
+
 /// One-time cleanup: remove desk_* entries and duplicates from tracked_sessions.txt.
 /// Uses atomic write (write to temp file, then rename) to prevent truncation on crash.
 fn cleanup_tracked_sessions() {
@@ -2291,7 +2410,9 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
 
-                                // Read first few lines to extract preview and cwd
+                                // Read the first few lines to extract preview and cwd.
+                                // A tracked session must remain visible even when it has no
+                                // assistant record yet (for example after an API failure).
                                 let (preview, cwd) = extract_session_info(&path);
 
                                 // Use cwd from JSONL if available (authoritative),
@@ -2712,7 +2833,7 @@ fn extract_session_info(path: &std::path::Path) -> (String, String) {
     let mut cwd = String::new();
     let mut preview = String::new();
 
-    // Scan up to 100 lines to find cwd and first real user message.
+    // Scan up to 100 lines to find cwd and the first real user message.
     for line in reader.lines().take(100) {
         let line = match line {
             Ok(l) => l,
@@ -2957,6 +3078,88 @@ async fn load_session(path: String) -> Result<Vec<Value>, String> {
     Ok(messages)
 }
 
+/// Compute billing totals and the latest occupied-context snapshot from a
+/// persisted Claude session JSONL file. Assistant records may be repeated once
+/// per content block, so totals are de-duplicated by message id.
+fn compute_session_tokens<R: std::io::BufRead>(reader: R) -> Value {
+    let mut seen_message_ids = std::collections::HashSet::new();
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+    let mut context_input_tokens: u64 = 0;
+    let mut context_output_tokens: u64 = 0;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(json) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if json["type"].as_str() != Some("assistant") {
+            continue;
+        }
+        let message = &json["message"];
+        let usage = &message["usage"];
+        if !usage.is_object() {
+            continue;
+        }
+
+        let input = usage["input_tokens"].as_u64().unwrap_or(0);
+        let output = usage["output_tokens"].as_u64().unwrap_or(0);
+        let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        let direct_cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let cache_creation = if direct_cache_creation > 0 {
+            direct_cache_creation
+        } else {
+            usage["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0)
+                + usage["cache_creation"]["ephemeral_5m_input_tokens"].as_u64().unwrap_or(0)
+        };
+
+        // The latest assistant API call is the authoritative context snapshot.
+        context_input_tokens = input + cache_read + cache_creation;
+        context_output_tokens = output;
+
+        let message_id = message["id"].as_str().unwrap_or_default();
+        if !message_id.is_empty() && seen_message_ids.insert(message_id.to_string()) {
+            total_input_tokens += input;
+            total_output_tokens += output;
+        }
+    }
+
+    serde_json::json!({
+        "totalInputTokens": total_input_tokens,
+        "totalOutputTokens": total_output_tokens,
+        "contextInputTokens": context_input_tokens,
+        "contextOutputTokens": context_output_tokens,
+    })
+}
+
+#[tauri::command]
+async fn get_session_tokens(session_id: String) -> Result<Value, String> {
+    // Find the JSONL file: ~/.claude/projects/<any-project>/<session_id>.jsonl
+    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
+    let projects_dir = home.join(".claude").join("projects");
+    let mut jsonl_path = None;
+
+    if projects_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let candidate = entry.path().join(format!("{}.jsonl", &session_id));
+                if candidate.exists() {
+                    jsonl_path = Some(candidate);
+                    break;
+                }
+            }
+        }
+    }
+
+    let path = jsonl_path.ok_or_else(|| format!("Session JSONL not found for: {}", session_id))?;
+
+    let file = std::fs::File::open(&path)
+        .map_err(|e| format!("Failed to open session JSONL: {}", e))?;
+    Ok(compute_session_tokens(std::io::BufReader::new(file)))
+}
+
 #[tauri::command]
 async fn open_in_vscode(path: String) -> Result<(), String> {
     let mut cmd = Command::new("code");
@@ -3026,6 +3229,78 @@ async fn open_with_default_app(path: String) -> Result<(), String> {
             .map_err(|e| format!("Failed to open file: {}", e))?;
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn open_folder_in_terminal(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .args(["-a", "Terminal", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to open Terminal: {}", e))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Try Windows Terminal first, fallback to cmd
+        let wt_result = Command::new("wt")
+            .args(["-d", &path])
+            .creation_flags(0x08000000)
+            .spawn();
+        if wt_result.is_err() {
+            Command::new("cmd")
+                .args(["/K", "cd", "/d", &path])
+                .creation_flags(0x00000010) // CREATE_NEW_CONSOLE
+                .spawn()
+                .map_err(|e| format!("Failed to open terminal: {}", e))?;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cd_cmd = format!("cd '{}' && $SHELL", path.replace('\'', "'\\''"));
+        let terminals: &[(&str, &[&str])] = &[
+            ("gnome-terminal", &["--", "bash", "-c", cd_cmd.as_str()] as &[&str]),
+            ("konsole", &["-e", "bash", "-c", cd_cmd.as_str()]),
+            ("xterm", &["-e", cd_cmd.as_str()]),
+        ];
+        let mut opened = false;
+        for (term, args) in terminals {
+            if std::process::Command::new(term)
+                .args(args.iter().copied())
+                .spawn()
+                .is_ok()
+            {
+                opened = true;
+                break;
+            }
+        }
+        if !opened {
+            return Err("No supported terminal emulator found".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_folder_in_terminal_admin(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Use PowerShell to start Windows Terminal elevated
+        let ps_script = format!(
+            "Start-Process wt -Verb RunAs -ArgumentList '-d', '{}'",
+            path.replace('\'', "''")
+        );
+        std::process::Command::new("powershell")
+            .args(["-Command", &ps_script])
+            .creation_flags(0x08000000)
+            .spawn()
+            .map_err(|e| format!("Failed to open elevated terminal: {}", e))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Administrator terminal is only supported on Windows".to_string())
+    }
 }
 
 /// Helper: create an NSURL from a file path string (macOS only).
@@ -3511,6 +3786,58 @@ async fn export_session_json(path: String, output_path: String) -> Result<(), St
     Ok(())
 }
 
+/// Get the user's home directory path
+#[tauri::command]
+fn get_home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Cannot find home directory".to_string())
+}
+
+/// Read absolute file paths from the system clipboard.
+///
+/// On Windows this reads the CF_HDROP clipboard format (files copied from
+/// Explorer), which WebView2 does not expose via `clipboardData.files` on
+/// paste events. Other platforms return empty — the JS-side extraction
+/// (text/uri-list / File.path) covers macOS and Linux.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn read_clipboard_file_paths() -> Vec<String> {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows_sys::Win32::System::Ole::CF_HDROP;
+    use windows_sys::Win32::UI::Shell::DragQueryFileW;
+
+    let mut paths: Vec<String> = Vec::new();
+    unsafe {
+        // OpenClipboard must be called on a thread with an open message loop —
+        // Tauri command threads satisfy this (each command runs on the main loop).
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return paths;
+        }
+        let hdrop = GetClipboardData(CF_HDROP as u32);
+        if !hdrop.is_null() {
+            // Query file count first (u32::MAX = DragQueryFileW's count request)
+            let count = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0);
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, std::ptr::null_mut(), 0);
+                if len > 0 {
+                    let mut buf = vec![0u16; (len + 1) as usize];
+                    DragQueryFileW(hdrop, i, buf.as_mut_ptr(), (len + 1) as u32);
+                    paths.push(String::from_utf16_lossy(&buf[..len as usize]));
+                }
+            }
+        }
+        CloseClipboard();
+    }
+    paths
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn read_clipboard_file_paths() -> Vec<String> {
+    Vec::new()
+}
+
 /// List recent projects by scanning ~/.claude/projects/ directory names
 #[tauri::command]
 async fn list_recent_projects() -> Result<Vec<Value>, String> {
@@ -3593,7 +3920,8 @@ async fn list_recent_projects() -> Result<Vec<Value>, String> {
     Ok(result)
 }
 
-/// Start watching a directory for file changes, emit events to frontend
+/// Start watching a directory for file changes, emit batched events to frontend.
+/// Events are collected into 200ms windows to avoid IPC storms on high-frequency dirs.
 #[tauri::command]
 async fn watch_directory(
     app: AppHandle,
@@ -3601,15 +3929,14 @@ async fn watch_directory(
     path: String,
 ) -> Result<(), String> {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     // Stop existing watcher for this path if any
     {
         let mut watchers = state.watchers.lock().await;
         watchers.remove(&path);
     }
-
-    let app_clone = app.clone();
-    let path_clone = path.clone();
 
     // Directories whose changes are noise for the UI (high-frequency writes by CLI, git, etc.)
     const IGNORED_SEGMENTS: &[&str] = &[
@@ -3622,6 +3949,93 @@ async fn watch_directory(
         ".venv",
     ];
 
+    // Shared buffer: events accumulate here between flush cycles.
+    // std::sync::Mutex because the notify callback runs on a non-async OS thread.
+    let pending: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let pending_for_watcher = pending.clone();
+
+    // Shutdown signal: dropping the sender → receiver fires → flush task drains and exits.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app_for_flush = app.clone();
+    let path_for_flush = path.clone();
+
+    // Background flush task: every 200ms, merge buffered events and emit a single IPC event
+    let _flush = tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    let mut buf = match pending.lock() {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    let events: Vec<_> = buf.drain(..).collect();
+                    drop(buf);
+
+                    let mut seen = std::collections::HashSet::new();
+                    let mut all_paths = Vec::new();
+                    for (_, paths) in &events {
+                        for p in paths {
+                            if seen.insert(p.clone()) {
+                                all_paths.push(p.clone());
+                            }
+                        }
+                    }
+
+                    let primary_kind = if events.iter().any(|(k, _)| k == "created" || k == "removed") {
+                        if events.iter().any(|(k, _)| k == "created") { "created" } else { "removed" }
+                    } else {
+                        "modified"
+                    };
+
+                    let _ = app_for_flush.emit(
+                        "fs:change",
+                        serde_json::json!({
+                            "kind": primary_kind,
+                            "paths": all_paths,
+                            "root": path_for_flush,
+                        }),
+                    );
+                }
+                _ = &mut shutdown_rx => {
+                    // Final drain before exit
+                    if let Ok(mut buf) = pending.lock() {
+                        if !buf.is_empty() {
+                            let events: Vec<_> = buf.drain(..).collect();
+                            drop(buf);
+                            let mut seen = std::collections::HashSet::new();
+                            let mut all_paths = Vec::new();
+                            for (_, paths) in &events {
+                                for p in paths {
+                                    if seen.insert(p.clone()) {
+                                        all_paths.push(p.clone());
+                                    }
+                                }
+                            }
+                            let primary_kind = if events.iter().any(|(k, _)| k == "created" || k == "removed") {
+                                if events.iter().any(|(k, _)| k == "created") { "created" } else { "removed" }
+                            } else {
+                                "modified"
+                            };
+                            let _ = app_for_flush.emit(
+                                "fs:change",
+                                serde_json::json!({
+                                    "kind": primary_kind,
+                                    "paths": all_paths,
+                                    "root": path_for_flush,
+                                }),
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             let kind = match event.kind {
@@ -3630,7 +4044,6 @@ async fn watch_directory(
                 EventKind::Remove(_) => "removed",
                 _ => return,
             };
-            // Filter out paths under ignored directories to prevent UI render storms
             let paths: Vec<String> = event
                 .paths
                 .iter()
@@ -3646,14 +4059,9 @@ async fn watch_directory(
             if paths.is_empty() {
                 return;
             }
-            let _ = app_clone.emit(
-                "fs:change",
-                serde_json::json!({
-                    "kind": kind,
-                    "paths": paths,
-                    "root": path_clone,
-                }),
-            );
+            if let Ok(mut buf) = pending_for_watcher.lock() {
+                buf.push((kind.to_string(), paths));
+            }
         }
     })
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
@@ -3663,7 +4071,13 @@ async fn watch_directory(
         .map_err(|e| format!("Failed to watch: {}", e))?;
 
     let mut watchers = state.watchers.lock().await;
-    watchers.insert(path, watcher);
+    watchers.insert(
+        path,
+        WatchHandle {
+            _watcher: watcher,
+            _shutdown: shutdown_tx,
+        },
+    );
 
     Ok(())
 }
@@ -3911,6 +4325,38 @@ struct SkillTranslationConfig {
     proxy_url: Option<String>,
 }
 
+fn skill_translation_config_path() -> Result<std::path::PathBuf, String> {
+    Ok(safe_data_dir()?.join("skill-translation.json"))
+}
+
+#[tauri::command]
+fn load_skill_translation_config() -> Result<Option<SkillTranslationConfig>, String> {
+    let path = skill_translation_config_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read skill translation config: {}", e))?;
+    let json = decrypt_providers(&raw)?;
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|e| format!("Cannot parse skill translation config: {}", e))
+}
+
+#[tauri::command]
+fn save_skill_translation_config(config: SkillTranslationConfig) -> Result<(), String> {
+    let path = skill_translation_config_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create dir: {}", e))?;
+    }
+    let json = serde_json::to_string(&config)
+        .map_err(|e| format!("Serialize error: {}", e))?;
+    let sealed = encrypt_providers(&json)?;
+    std::fs::write(&path, sealed).map_err(|e| format!("Write error: {}", e))?;
+    harden_path_permissions(&path);
+    Ok(())
+}
+
 /// YAML frontmatter fields for SKILL.md files
 #[derive(Debug, Deserialize, Default)]
 struct SkillFrontmatter {
@@ -4086,6 +4532,11 @@ fn collect_skill_files(dir: &std::path::Path, max_depth: usize) -> Vec<std::path
     }
 
     let mut found = Vec::new();
+    let direct = dir.join("SKILL.md");
+    if direct.exists() {
+        found.push(direct);
+        return found;
+    }
     visit(dir, 0, max_depth, &mut found);
     found
 }
@@ -4148,9 +4599,16 @@ fn scan_skill_commands(dir: &std::path::Path, source: &str) -> Vec<UnifiedComman
     collect_skill_files(dir, 8)
         .into_iter()
         .map(|skill_file| {
-            let (name, description, fm) = skill_display_fields(&skill_file);
+            let (_display_name, description, fm) = skill_display_fields(&skill_file);
+            // Claude invokes a skill by its directory name, not an optional
+            // human-facing `name` in frontmatter.
+            let command_name = skill_file
+                .parent()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
             UnifiedCommand {
-                name: format!("/{}", name),
+                name: format!("/{}", command_name),
                 description,
                 source: source.to_string(),
                 category: "skill".to_string(),
@@ -4192,30 +4650,25 @@ fn dedupe_unified_skill_commands(commands: Vec<UnifiedCommand>) -> Vec<UnifiedCo
 
 /// Scan and return all available skills (global + project)
 #[tauri::command]
-async fn list_skills(cwd: Option<String>) -> Result<Vec<SkillInfo>, String> {
+async fn list_skills(cwd: Option<String>, additional_dirs: Option<Vec<String>>) -> Result<Vec<SkillInfo>, String> {
     let mut skills: Vec<SkillInfo> = vec![];
 
-    // Global skills: Codex, legacy Claude, and shared agent skill directories.
+    // Only Claude's native skill directory is scanned by default. Codex and
+    // other agent-specific skills are not necessarily compatible with Claude.
     if let Some(home) = dirs::home_dir() {
-        for dir in [
-            home.join(".codex").join("skills"),
-            home.join(".agents").join("skills"),
-            home.join(".claude").join("skills"),
-            home.join(".codex").join("plugins").join("cache"),
-        ] {
-            skills.extend(scan_skill_infos(&dir, "global"));
-        }
+        skills.extend(scan_skill_infos(&home.join(".claude").join("skills"), "global"));
     }
 
-    // Project skills: prefer Codex layout, keep Claude layout for compatibility.
+    // Project-local Claude skills.
     if let Some(ref cwd_path) = cwd {
         let cwd = std::path::Path::new(cwd_path);
-        for dir in [
-            cwd.join(".codex").join("skills"),
-            cwd.join(".agents").join("skills"),
-            cwd.join(".claude").join("skills"),
-        ] {
-            skills.extend(scan_skill_infos(&dir, "project"));
+        skills.extend(scan_skill_infos(&cwd.join(".claude").join("skills"), "project"));
+    }
+
+    for dir in additional_dirs.unwrap_or_default() {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_absolute() {
+            skills.extend(scan_skill_infos(&path, "global"));
         }
     }
 
@@ -4758,7 +5211,7 @@ async fn delete_skill(path: String) -> Result<(), String> {
 
 /// Unified endpoint that returns all commands and skills in a single call
 #[tauri::command]
-async fn list_all_commands(cwd: Option<String>) -> Result<Vec<UnifiedCommand>, String> {
+async fn list_all_commands(cwd: Option<String>, additional_dirs: Option<Vec<String>>) -> Result<Vec<UnifiedCommand>, String> {
     let mut commands: Vec<UnifiedCommand> = vec![];
 
     // 1. Built-in commands: (name, description, has_args, execution)
@@ -4905,27 +5358,22 @@ async fn list_all_commands(cwd: Option<String>) -> Result<Vec<UnifiedCommand>, S
         commands.extend(scan_commands_dir(&project_dir, "project"));
     }
 
-    // 4. Global skills: Codex, legacy Claude, and shared agent skill directories.
+    // 4. Global Claude skills only.
     if let Some(home) = dirs::home_dir() {
-        for dir in [
-            home.join(".codex").join("skills"),
-            home.join(".agents").join("skills"),
-            home.join(".claude").join("skills"),
-            home.join(".codex").join("plugins").join("cache"),
-        ] {
-            commands.extend(scan_skill_commands(&dir, "global"));
-        }
+        commands.extend(scan_skill_commands(&home.join(".claude").join("skills"), "global"));
     }
 
-    // 5. Project skills: prefer Codex layout, keep Claude layout for compatibility.
+    // 5. Project-local Claude skills.
     if let Some(ref cwd_path) = cwd {
         let cwd = std::path::Path::new(cwd_path);
-        for dir in [
-            cwd.join(".codex").join("skills"),
-            cwd.join(".agents").join("skills"),
-            cwd.join(".claude").join("skills"),
-        ] {
-            commands.extend(scan_skill_commands(&dir, "project"));
+        commands.extend(scan_skill_commands(&cwd.join(".claude").join("skills"), "project"));
+    }
+
+    // 6. User-selected compatible skill roots.
+    for dir in additional_dirs.unwrap_or_default() {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_absolute() {
+            commands.extend(scan_skill_commands(&path, "global"));
         }
     }
 
@@ -7794,11 +8242,13 @@ pub fn run() {
             kill_session,
             list_active_processes,
             track_session,
+            untrack_session,
             delete_session,
             list_sessions,
             get_profile_stats,
             search_sessions,
             load_session,
+            get_session_tokens,
             read_file_tree,
             read_file_content,
             write_file_content,
@@ -7814,6 +8264,8 @@ pub fn run() {
             export_session_markdown,
             export_session_json,
             list_recent_projects,
+            get_home_dir,
+            read_clipboard_file_paths,
             watch_directory,
             unwatch_directory,
             save_temp_file,
@@ -7822,6 +8274,8 @@ pub fn run() {
             read_file_base64,
             list_slash_commands,
             list_skills,
+            load_skill_translation_config,
+            save_skill_translation_config,
             read_skill,
             write_skill,
             delete_skill,
@@ -7853,6 +8307,8 @@ pub fn run() {
             start_claude_login,
             check_claude_auth,
             open_terminal_login,
+            open_folder_in_terminal,
+            open_folder_in_terminal_admin,
             load_custom_previews,
             save_custom_previews,
             load_pinned_sessions,
@@ -7872,7 +8328,48 @@ pub fn run() {
 
 #[cfg(test)]
 mod decode_tests {
-    use super::{decode_project_name, provider_messages_endpoint};
+    use super::{compute_session_tokens, decode_project_name, extract_session_info, provider_messages_endpoint};
+
+    #[test]
+    fn test_session_tokens_use_latest_context_and_deduplicate_blocks() {
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900,\"output_tokens\":20}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900,\"output_tokens\":20}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":1050,\"output_tokens\":10}}}\n",
+        );
+        let usage = compute_session_tokens(std::io::Cursor::new(jsonl));
+        assert_eq!(usage["totalInputTokens"], 150);
+        assert_eq!(usage["totalOutputTokens"], 30);
+        assert_eq!(usage["contextInputTokens"], 1100);
+        assert_eq!(usage["contextOutputTokens"], 10);
+    }
+
+    #[test]
+    fn test_session_info_does_not_require_assistant_reply() {
+        let path = std::env::temp_dir().join(format!(
+            "tokenicode-session-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"type":"user","cwd":"D:\\work","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write test session");
+
+        let info = extract_session_info(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(info, ("hi".to_string(), r"D:\work".to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_dpapi_master_key_roundtrip() {
+        let key = [42u8; super::MASTER_KEY_LEN];
+        let sealed = super::seal_master_key(&key).expect("seal key");
+        assert!(sealed.starts_with(super::DPAPI_MAGIC));
+        assert_eq!(super::open_master_key(&sealed).expect("open key"), key);
+    }
 
     #[test]
     fn test_openai_endpoint_keeps_deepseek_bare_base_url() {

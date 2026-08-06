@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useCallback, useState } from 'react';
+import { useEffect, useMemo, useCallback, useState, useRef } from 'react';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSettingsStore } from '../../stores/settingsStore';
@@ -9,6 +9,8 @@ import { listen } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useT } from '../../lib/i18n';
 import { parseSessionMessages } from '../../lib/session-loader';
+import { getDateCategory } from '../../lib/date-utils';
+import { isWindows } from '../../lib/platform';
 import { SessionGroup } from './SessionGroup';
 import { SessionItem } from './SessionItem';
 import { SessionContextMenu, ProjectContextMenu } from './SessionContextMenu';
@@ -125,6 +127,20 @@ export function ConversationList() {
     } catch { return new Set(); }
   });
   const [showArchived, setShowArchived] = useState(false);
+
+  // View mode: 'folder' | 'recent'
+  const [viewMode, setViewMode] = useState<'folder' | 'recent'>(() => {
+    try {
+      const saved = localStorage.getItem('tokenicode_conversation_view_mode');
+      return saved === 'recent' ? 'recent' : 'folder';
+    } catch { return 'folder'; }
+  });
+
+  // Highlight a session (for "Locate in Folder" flash)
+  const [highlightedSessionId, setHighlightedSessionId] = useState<string | null>(null);
+
+  // Ref map for project group scrolling
+  const projectGroupRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
   // Multi-select
   const [multiSelect, setMultiSelect] = useState(false);
@@ -261,6 +277,46 @@ export function ConversationList() {
     return entries;
   }, [filtered]);
 
+  // Recently Active view: pinned first, then date-grouped by modifiedAt descending
+  const recentlyActiveGroups = useMemo(() => {
+    const pinned: SessionListItem[] = [];
+    const unpinned: SessionListItem[] = [];
+
+    for (const s of filtered) {
+      if (pinnedSessions.has(s.id)) {
+        pinned.push(s);
+      } else {
+        unpinned.push(s);
+      }
+    }
+
+    pinned.sort((a, b) => b.modifiedAt - a.modifiedAt);
+
+    const categoryMap = new Map<string, SessionListItem[]>();
+    for (const s of unpinned) {
+      const cat = getDateCategory(s.modifiedAt);
+      if (!categoryMap.has(cat)) categoryMap.set(cat, []);
+      categoryMap.get(cat)!.push(s);
+    }
+
+    const categoryOrder = [
+      { key: 'today', label: t('conv.today') },
+      { key: 'yesterday', label: t('conv.yesterday') },
+      { key: 'thisWeek', label: t('conv.thisWeek') },
+      { key: 'earlier', label: t('conv.older') },
+    ];
+
+    const dateGroups: { category: string; label: string; items: SessionListItem[] }[] = [];
+    for (const { key, label } of categoryOrder) {
+      const items = categoryMap.get(key);
+      if (items && items.length > 0) {
+        dateGroups.push({ category: key, label, items });
+      }
+    }
+
+    return { pinned, dateGroups };
+  }, [filtered, pinnedSessions, t]);
+
   // Content-only matches: sessions hit by content search but NOT by metadata filter
   const contentOnlyMatches = useMemo(() => {
     if (!searchQuery.trim() || contentSearchResults.size === 0) return [];
@@ -354,6 +410,21 @@ export function ConversationList() {
         return;
       }
       const { messages, agents } = parseSessionMessages(rawMessages);
+
+      // Restore both billing totals and the latest occupied-context snapshot.
+      // Persisted Claude JSONL contains full assistant usage records; without
+      // this step, selecting a historical session incorrectly resets Ctx to 0.
+      const tokenUsage = await bridge.getSessionTokens(sessionId).catch(() => null);
+      if (tokenUsage) {
+        setSessionMeta(sessionId, {
+          inputTokens: tokenUsage.contextInputTokens,
+          outputTokens: tokenUsage.contextOutputTokens,
+          contextInputTokens: tokenUsage.contextInputTokens,
+          contextOutputTokens: tokenUsage.contextOutputTokens,
+          totalInputTokens: tokenUsage.totalInputTokens,
+          totalOutputTokens: tokenUsage.totalOutputTokens,
+        });
+      }
 
       // Apply agents
       for (const agent of agents) {
@@ -503,13 +574,20 @@ export function ConversationList() {
   // Build flat list of visible session IDs for shift+click range selection
   const flatSessionIds = useMemo(() => {
     const ids: string[] = [];
-    for (const [project, items] of projectGroups) {
-      if (isExpanded(project)) {
-        for (const s of items) ids.push(s.id);
+    if (viewMode === 'recent') {
+      for (const s of recentlyActiveGroups.pinned) ids.push(s.id);
+      for (const group of recentlyActiveGroups.dateGroups) {
+        for (const s of group.items) ids.push(s.id);
+      }
+    } else {
+      for (const [project, items] of projectGroups) {
+        if (isExpanded(project)) {
+          for (const s of items) ids.push(s.id);
+        }
       }
     }
     return ids;
-  }, [projectGroups, isExpanded]);
+  }, [projectGroups, recentlyActiveGroups, isExpanded, viewMode]);
 
   // Multi-select handlers (with shift+click range support)
   const handleToggleCheck = useCallback((sessionId: string, shiftKey?: boolean) => {
@@ -588,6 +666,57 @@ export function ConversationList() {
     setSelectedIds(new Set());
   }, []);
 
+  // Folder operation handlers (resolve projectKey to real path)
+  const resolveRealPathFromKey = useCallback((projectKey: string): string => {
+    const suffix = projectKey.replace(/^~/, '');
+    const allSessions = useSessionStore.getState().sessions;
+    const match = allSessions.find((s) => {
+      const raw = s.project || s.projectDir;
+      return raw.endsWith(suffix);
+    });
+    const realPath = match ? (match.project || match.projectDir) : resolveProjectPath(projectKey);
+    return realPath;
+  }, []);
+
+  const handleOpenInExplorer = useCallback((projectKey: string) => {
+    const realPath = resolveRealPathFromKey(projectKey);
+    bridge.openWithDefaultApp(realPath).catch(() => {});
+  }, [resolveRealPathFromKey]);
+
+  const handleOpenInTerminal = useCallback((projectKey: string) => {
+    const realPath = resolveRealPathFromKey(projectKey);
+    bridge.openFolderInTerminal(realPath).catch(() => {});
+  }, [resolveRealPathFromKey]);
+
+  const handleOpenInTerminalAdmin = useCallback((projectKey: string) => {
+    const realPath = resolveRealPathFromKey(projectKey);
+    bridge.openFolderInTerminalAdmin(realPath).catch(() => {});
+  }, [resolveRealPathFromKey]);
+
+  const handleLocateInFolder = useCallback((session: SessionListItem) => {
+    const raw = session.project || session.projectDir;
+    const projectKey = normalizeProjectKey(raw);
+    // Switch to folder view and expand the group
+    setViewMode('folder');
+    setManualExpanded((prev) => { const next = new Set(prev); next.add(projectKey); return next; });
+    setManualCollapsed((prev) => { const next = new Set(prev); next.delete(projectKey); return next; });
+    setHighlightedSessionId(session.id);
+    // Scroll to the project group after render
+    setTimeout(() => {
+      const el = projectGroupRefs.current.get(projectKey);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  }, []);
+
+  // Clear highlight after animation
+  useEffect(() => {
+    if (!highlightedSessionId) return;
+    const timer = setTimeout(() => setHighlightedSessionId(null), 2200);
+    return () => clearTimeout(timer);
+  }, [highlightedSessionId]);
+
   return (
     <div className="flex flex-col gap-1 px-3">
       {/* Search + Filters */}
@@ -643,6 +772,43 @@ export function ConversationList() {
         </div>
       </div>
 
+      {/* View mode toggle */}
+      <div className="flex items-center gap-1 px-1 mb-1">
+        <button
+          onClick={() => setViewMode('folder')}
+          className={`flex-1 py-1 text-[11px] rounded-lg transition-smooth
+            ${viewMode === 'folder'
+              ? 'bg-accent/10 text-accent font-medium'
+              : 'text-text-tertiary hover:text-text-primary hover:bg-bg-secondary'
+            }`}
+        >
+          <span className="flex items-center justify-center gap-1">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+              <path d="M2 4h4l2 2h6v7H2V4z" />
+            </svg>
+            {t('conv.viewFolder')}
+          </span>
+        </button>
+        <button
+          onClick={() => setViewMode('recent')}
+          className={`flex-1 py-1 text-[11px] rounded-lg transition-smooth
+            ${viewMode === 'recent'
+              ? 'bg-accent/10 text-accent font-medium'
+              : 'text-text-tertiary hover:text-text-primary hover:bg-bg-secondary'
+            }`}
+        >
+          <span className="flex items-center justify-center gap-1">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+              <circle cx="8" cy="8" r="6" />
+              <path d="M8 4v4l3 2" />
+            </svg>
+            {t('conv.viewRecent')}
+          </span>
+        </button>
+      </div>
+
       {/* Loading */}
       {isLoading && sessions.length === 0 && (
         <div className="flex items-center justify-center py-6">
@@ -651,38 +817,113 @@ export function ConversationList() {
         </div>
       )}
 
-      {/* Project groups — detect duplicate folder names for disambiguation */}
-      {projectGroups.map(([project, items]) => {
-        const baseName = projectLabel(project);
-        const isDuplicate = projectGroups.filter(([k]) => projectLabel(k) === baseName).length > 1;
-        return (
-        <SessionGroup
-          key={project}
-          projectKey={project}
-          projectLabel={projectLabel(project, isDuplicate)}
-          projectPath={project}
-          sessions={items}
-          isExpanded={isExpanded(project)}
-          selectedId={selectedId}
-          runningSessions={runningSessions}
-          pinnedSessions={pinnedSessions}
-          archivedSessions={archivedSessions}
-          customPreviews={customPreviews}
-          multiSelect={multiSelect}
-          selectedIds={selectedIds}
-          onToggleCollapse={toggleCollapse}
-          onContextMenu={handleContextMenu}
-          onDelete={handleDeleteSingle}
-          onProjectContextMenu={handleProjectContextMenu}
-          onLoadSession={handleLoadSession}
-          onRename={handleRename}
-          onNewSession={handleNewSessionInProject}
-          onToggleCheck={handleToggleCheck}
-          renamingSessionId={renamingSessionId}
-          onRenameDone={handleRenameDone}
-        />
-        );
-      })}
+      {/* Session listing — folder view or recent view */}
+      {viewMode === 'folder' ? (
+        /* ---- Folder View ---- */
+        projectGroups.map(([project, items]) => {
+          const baseName = projectLabel(project);
+          const isDuplicate = projectGroups.filter(([k]) => projectLabel(k) === baseName).length > 1;
+          return (
+          <div
+            key={project}
+            ref={(el) => {
+              if (el) projectGroupRefs.current.set(project, el as HTMLDivElement);
+              else projectGroupRefs.current.delete(project);
+            }}
+          >
+            <SessionGroup
+              projectKey={project}
+              projectLabel={projectLabel(project, isDuplicate)}
+              projectPath={project}
+              sessions={items}
+              isExpanded={isExpanded(project)}
+              selectedId={selectedId}
+              runningSessions={runningSessions}
+              pinnedSessions={pinnedSessions}
+              archivedSessions={archivedSessions}
+              customPreviews={customPreviews}
+              multiSelect={multiSelect}
+              selectedIds={selectedIds}
+              onToggleCollapse={toggleCollapse}
+              onContextMenu={handleContextMenu}
+              onDelete={handleDeleteSingle}
+              onProjectContextMenu={handleProjectContextMenu}
+              onLoadSession={handleLoadSession}
+              onRename={handleRename}
+              onNewSession={handleNewSessionInProject}
+              onToggleCheck={handleToggleCheck}
+              renamingSessionId={renamingSessionId}
+              onRenameDone={handleRenameDone}
+              highlightedSessionId={highlightedSessionId}
+            />
+          </div>
+          );
+        })
+      ) : (
+        /* ---- Recently Active View ---- */
+        <>
+          {/* Pinned sessions */}
+          {recentlyActiveGroups.pinned.length > 0 && (
+            <div className="mb-1">
+              {recentlyActiveGroups.pinned.map((session) => (
+                <SessionItem
+                  key={session.id}
+                  session={session}
+                  isSelected={selectedId === session.id}
+                  isRunning={runningSessions.has(session.id)}
+                  isPinned={true}
+                  isArchived={archivedSessions.has(session.id)}
+                  displayName={displayName(session)}
+                  multiSelect={multiSelect}
+                  isChecked={selectedIds.has(session.id)}
+                  onSelect={handleLoadSession}
+                  onContextMenu={handleContextMenu}
+                  onRename={handleRename}
+                  onDelete={handleDeleteSingle}
+                  onToggleCheck={handleToggleCheck}
+                  triggerRename={renamingSessionId === session.id}
+                  onRenameDone={handleRenameDone}
+                  isHighlighted={highlightedSessionId === session.id}
+                />
+              ))}
+              {recentlyActiveGroups.dateGroups.length > 0 && (
+                <div className="my-1 mx-3 border-t border-border-subtle/50" />
+              )}
+            </div>
+          )}
+
+          {/* Date-grouped sessions */}
+          {recentlyActiveGroups.dateGroups.map(({ category, label, items }) => (
+            <div key={category}>
+              <div className="text-[11px] text-text-tertiary font-medium px-3 py-1 mt-1
+                select-none">
+                {label}
+              </div>
+              {items.map((session) => (
+                <SessionItem
+                  key={session.id}
+                  session={session}
+                  isSelected={selectedId === session.id}
+                  isRunning={runningSessions.has(session.id)}
+                  isPinned={false}
+                  isArchived={archivedSessions.has(session.id)}
+                  displayName={displayName(session)}
+                  multiSelect={multiSelect}
+                  isChecked={selectedIds.has(session.id)}
+                  onSelect={handleLoadSession}
+                  onContextMenu={handleContextMenu}
+                  onRename={handleRename}
+                  onDelete={handleDeleteSingle}
+                  onToggleCheck={handleToggleCheck}
+                  triggerRename={renamingSessionId === session.id}
+                  onRenameDone={handleRenameDone}
+                  isHighlighted={highlightedSessionId === session.id}
+                />
+              ))}
+            </div>
+          ))}
+        </>
+      )}
 
       {/* Content matches section (async, appears after metadata results) */}
       {searchQuery.trim() && contentOnlyMatches.length > 0 && (
@@ -801,6 +1042,7 @@ export function ConversationList() {
           onArchive={handleToggleArchive}
           isPinned={pinnedSessions.has(contextMenu.session.id)}
           isArchived={archivedSessions.has(contextMenu.session.id)}
+          onLocateInFolder={viewMode === 'recent' ? handleLocateInFolder : undefined}
           onClose={() => setContextMenu(null)}
         />
       )}
@@ -814,6 +1056,10 @@ export function ConversationList() {
           onNewSession={handleNewSessionInProject}
           onDeleteAll={handleDeleteAllInProject}
           onSelectMode={handleSelectMode}
+          onOpenInExplorer={handleOpenInExplorer}
+          onOpenInTerminal={handleOpenInTerminal}
+          onOpenInTerminalAdmin={handleOpenInTerminalAdmin}
+          isWindows={isWindows()}
           onClose={() => setProjectMenu(null)}
         />
       )}

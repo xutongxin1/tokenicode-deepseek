@@ -13,6 +13,7 @@ interface SessionContextMenuProps {
   onDelete: (session: SessionListItem) => void;
   onPin?: (session: SessionListItem) => void;
   onArchive?: (session: SessionListItem) => void;
+  onLocateInFolder?: (session: SessionListItem) => void;
   isPinned?: boolean;
   isArchived?: boolean;
   onClose: () => void;
@@ -28,6 +29,7 @@ export function SessionContextMenu({
   onDelete,
   onPin,
   onArchive,
+  onLocateInFolder,
   isPinned,
   isArchived,
   onClose,
@@ -102,6 +104,22 @@ export function SessionContextMenu({
         </button>
       )}
 
+      {onLocateInFolder && (
+        <button
+          onClick={() => { onClose(); onLocateInFolder(session); }}
+          className="w-full flex items-center gap-2.5 px-3 py-1.5
+            text-xs text-text-primary hover:bg-bg-secondary transition-smooth"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2 4h4l2 2h6v7H2V4z" />
+            <circle cx="8" cy="9" r="2" />
+            <path d="M9.5 10.5L11 12" />
+          </svg>
+          {t('conv.locateInFolder')}
+        </button>
+      )}
+
       {session.path && (
         <button
           onClick={() => { onClose(); onRevealInFinder(session); }}
@@ -157,6 +175,10 @@ interface ProjectContextMenuProps {
   onNewSession: (project: string) => void;
   onDeleteAll: (project: string) => void;
   onSelectMode?: (project: string) => void;
+  onOpenInExplorer?: (project: string) => void;
+  onOpenInTerminal?: (project: string) => void;
+  onOpenInTerminalAdmin?: (project: string) => void;
+  isWindows?: boolean;
   onClose: () => void;
 }
 
@@ -167,6 +189,10 @@ export function ProjectContextMenu({
   onNewSession,
   onDeleteAll,
   onSelectMode,
+  onOpenInExplorer,
+  onOpenInTerminal,
+  onOpenInTerminalAdmin,
+  isWindows,
   onClose,
 }: ProjectContextMenuProps) {
   const t = useT();
@@ -225,6 +251,56 @@ export function ProjectContextMenu({
             {t('conv.selectMode')}
           </button>
         </>
+      )}
+
+      {(onOpenInExplorer || onOpenInTerminal || onOpenInTerminalAdmin) && (
+        <div className="my-1 border-t border-border-subtle" />
+      )}
+
+      {onOpenInExplorer && (
+        <button
+          onClick={() => { onClose(); onOpenInExplorer(project); }}
+          className="w-full flex items-center gap-2.5 px-3 py-1.5
+            text-xs text-text-primary hover:bg-bg-secondary transition-smooth"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2 4h4l2 2h6v7H2V4z" />
+            <path d="M8 11v-3M6 9h4" />
+          </svg>
+          {t('conv.openInExplorer')}
+        </button>
+      )}
+
+      {onOpenInTerminal && (
+        <button
+          onClick={() => { onClose(); onOpenInTerminal(project); }}
+          className="w-full flex items-center gap-2.5 px-3 py-1.5
+            text-xs text-text-primary hover:bg-bg-secondary transition-smooth"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="2" y="3" width="12" height="10" rx="1.5" />
+            <path d="M5 13V9l3 3-3 3" />
+          </svg>
+          {t('conv.openInTerminal')}
+        </button>
+      )}
+
+      {onOpenInTerminalAdmin && isWindows && (
+        <button
+          onClick={() => { onClose(); onOpenInTerminalAdmin(project); }}
+          className="w-full flex items-center gap-2.5 px-3 py-1.5
+            text-xs text-text-primary hover:bg-bg-secondary transition-smooth"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="2" y="3" width="12" height="10" rx="1.5" />
+            <path d="M5 13V9l3 3-3 3" />
+            <path d="M11 7l-6 0" />
+          </svg>
+          {t('conv.openInTerminalAdmin')}
+        </button>
       )}
 
       <div className="my-1 border-t border-border-subtle" />
