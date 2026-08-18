@@ -204,20 +204,40 @@ export function InputBar() {
     textareaRef.current?.setText(text);
   }, [setInput]);
 
-  // Restore input text from store when session switches (restoreFromCache → inputDraft change)
+  // Restore input text from store when session switches (restoreFromCache → inputDraft change).
+  // Tab switches remount this component (ChatPanel key={selectedSessionId}), so the
+  // mount render itself must sync the editor with the tab draft — comparing content
+  // instead of ref-guarding handles both remount restore and runtime draft changes.
   const prevInputDraftRef = useRef(inputDraft);
   useEffect(() => {
-    if (prevInputDraftRef.current !== inputDraft) {
-      // Never call setText during IME composition — it destroys the composing state
-      if (textareaRef.current?.isComposing()) {
-        prevInputDraftRef.current = inputDraft;
-        return;
-      }
-      // Only sync editor if its content actually differs (avoid cursor reset on user typing)
+    // Never call setText during IME composition — it destroys the composing state
+    if (prevInputDraftRef.current !== inputDraft && textareaRef.current?.isComposing()) {
+      prevInputDraftRef.current = inputDraft;
+      return;
+    }
+    // Only sync editor if its content actually differs (avoid cursor reset on user typing).
+    // Returns false when the editor instance isn't ready yet — Tiptap v3 creates it
+    // asynchronously in an effect, so on remount it may still be null here.
+    const syncIfNeeded = (): boolean => {
+      if (!textareaRef.current?.getEditor()) return false;
       const current = textareaRef.current?.getText() ?? '';
       if (current !== inputDraft) {
         textareaRef.current?.setText(inputDraft);
       }
+      return true;
+    };
+    if (!syncIfNeeded()) {
+      // Editor not ready yet — retry on the next frames until it exists (or give up after ~1s)
+      let cancelled = false;
+      let attempts = 0;
+      const retry = () => {
+        if (cancelled || attempts++ > 60 || syncIfNeeded()) return;
+        requestAnimationFrame(retry);
+      };
+      requestAnimationFrame(retry);
+      return () => {
+        cancelled = true;
+      };
     }
     prevInputDraftRef.current = inputDraft;
   }, [inputDraft]);
