@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
@@ -8221,10 +8221,20 @@ pub fn run() {
                 }
             }
 
-            // Register updater plugin (desktop only)
+            // Register updater plugin (desktop only).
+            // Guard: only register when `plugins.updater` exists in tauri.conf.json.
+            // Dev/standalone builds (e.g. the GitHub Actions "from xtx" workflow)
+            // strip the updater section; registering unconditionally panics at
+            // startup with "Error deserializing 'plugins.updater' ... invalid type:
+            // null" — a flash-crash on launch.
             #[cfg(desktop)]
-            app.handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())?;
+            {
+                let config = app.config();
+                if config.plugins.0.contains_key("updater") {
+                    app.handle()
+                        .plugin(tauri_plugin_updater::Builder::new().build())?;
+                }
+            }
 
             #[cfg(not(desktop))]
             let _ = app;

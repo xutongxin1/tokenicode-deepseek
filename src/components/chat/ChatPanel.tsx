@@ -632,14 +632,27 @@ export function ChatPanel() {
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    let upTimer: ReturnType<typeof setTimeout> | null = null;
     const onWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) {
-        // User is scrolling up — suppress auto-scroll
+        // User is scrolling up — suppress auto-scroll. Trackpad inertia and
+        // mouse-wheel bounce can emit tiny upward deltas after a downward
+        // scroll; without the timer those would permanently break
+        // follow-to-bottom. If the viewport is still near the bottom shortly
+        // after (the up-scroll didn't actually move it away), resume following.
         userScrollingUpRef.current = true;
+        if (upTimer) clearTimeout(upTimer);
+        upTimer = setTimeout(() => {
+          upTimer = null;
+          if (isNearBottomRef.current) userScrollingUpRef.current = false;
+        }, 250);
       }
     };
     el.addEventListener('wheel', onWheel, { passive: true });
-    return () => el.removeEventListener('wheel', onWheel);
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      if (upTimer) clearTimeout(upTimer);
+    };
   }, []);
 
   // Auto-scroll to bottom only when already near bottom and user isn't scrolling up
@@ -649,15 +662,51 @@ export function ChatPanel() {
     }
   }, [messages, partialText, partialThinking]);
 
+  // Follow-to-bottom driven by layout size changes. The state-deps effect above
+  // misses async height changes (image loads, font swaps, KaTeX, message commits
+  // landing after streaming ends) — those change scrollHeight without a React
+  // render, leaving the viewport stranded mid-answer. ResizeObserver catches
+  // every content resize and re-pins the bottom while the user is following.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (isNearBottomRef.current && !userScrollingUpRef.current) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    let observed: Element | null = null;
+    const observeContent = () => {
+      const content = el.firstElementChild;
+      if (content && content !== observed) {
+        if (observed) ro.unobserve(observed);
+        ro.observe(content);
+        observed = content;
+      }
+    };
+    observeContent();
+    // Re-bind when the scroll content swaps (WelcomeScreen ↔ message list)
+    const mo = new MutationObserver(observeContent);
+    mo.observe(el, { childList: true });
+    return () => {
+      ro.disconnect();
+      mo.disconnect();
+    };
+  }, []);
+
   // Force scroll to bottom when streaming ends. The streamed block is removed
   // and the final assistant message is committed in SEPARATE Zustand updates
   // (each setState re-renders synchronously), so on the isStreaming flip the
   // message list is still missing the final answer — scrolling immediately
   // pins the viewport to the last user question once the answer is appended.
-  // Defer to rAF so the scroll happens after the commit render lands and
-  // scrollHeight reflects the final message. Dependencies MUST stay [isStreaming]
-  // only: the commit render would re-run this effect and its cleanup would
-  // cancelAnimationFrame the pending scroll before it ever fires.
+  // Defer to rAF so the scroll happens after the commit render lands.
+  // Dependencies MUST stay [isStreaming] only: the commit render would re-run
+  // this effect and its cleanup would cancel the pending scroll before it fires.
+  //
+  // Keep snapping for up to a few frames while scrollHeight is still changing
+  // (commit renders landing late, async images/fonts): the previous
+  // "retry if distFromBottom > 2" check could never fire because after
+  // `scrollTop = scrollHeight` the remaining distance is always ~0.
   const wasStreamingRef = useRef(false);
   useEffect(() => {
     if (isStreaming) {
@@ -666,21 +715,28 @@ export function ChatPanel() {
     }
     if (!wasStreamingRef.current) return;
     wasStreamingRef.current = false;
-    const raf = requestAnimationFrame(() => {
+    let cancelled = false;
+    let lastHeight = -1;
+    let frames = 0;
+    const settleAtBottom = () => {
+      if (cancelled) return;
       const el = scrollRef.current;
       if (!el) return;
-      el.scrollTop = el.scrollHeight;
-      // Extremely defensive: if content is still growing (message commit
-      // landed after this frame), retry once on the next frame.
-      if (el.scrollHeight - el.scrollTop - el.clientHeight > 2) {
-        requestAnimationFrame(() => {
-          if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-        });
-      }
+      const height = el.scrollHeight;
+      el.scrollTop = height;
       userScrollingUpRef.current = false;
       isNearBottomRef.current = true;
-    });
-    return () => cancelAnimationFrame(raf);
+      if (height !== lastHeight && frames < 8) {
+        lastHeight = height;
+        frames += 1;
+        requestAnimationFrame(settleAtBottom);
+      }
+    };
+    const raf = requestAnimationFrame(settleAtBottom);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+    };
   }, [isStreaming]);
 
   useEffect(() => {
