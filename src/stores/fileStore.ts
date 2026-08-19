@@ -14,6 +14,10 @@ interface FileState {
   selectedFile: string | null;
   fileContent: string | null;
   isLoadingContent: boolean;
+  /** True when the file could not be previewed in-app and was handed to the
+   *  system default app instead (oversized image, binary file). FilePreview
+   *  renders an "opened externally" notice instead of an error. */
+  openedExternally: boolean;
   previewMode: PreviewMode;
   rootPath: string;
 
@@ -71,6 +75,7 @@ export const useFileStore = create<FileState>()((set, get) => ({
   selectedFile: null,
   fileContent: null,
   isLoadingContent: false,
+  openedExternally: false,
   previewMode: 'preview' as PreviewMode,
   rootPath: '',
   editContent: null,
@@ -138,27 +143,51 @@ export const useFileStore = create<FileState>()((set, get) => ({
 
     // Toggle selection: click again to deselect
     if (selectedFile === path) {
-      set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null });
+      set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null, openedExternally: false });
     } else {
-      set({ selectedFile: path, fileContent: null, isLoadingContent: true, previewMode: 'preview', editContent: null });
+      set({ selectedFile: path, fileContent: null, isLoadingContent: true, previewMode: 'preview', editContent: null, openedExternally: false });
 
-      // Binary-preview files: skip text reading, render with file:// URL in FilePreview
       const ext = path.split('.').pop()?.toLowerCase() || '';
+      const IMAGE_EXTS = new Set(['png','jpg','jpeg','gif','webp','bmp','ico']);
+      // Files rendered via base64 data URL in the webview
       const BINARY_PREVIEW = new Set([
-        'png','jpg','jpeg','gif','webp','bmp','ico',
+        ...IMAGE_EXTS,
         'pdf','mp4','webm','mov','avi',
         'mp3','wav','ogg','aac','m4a',
       ]);
+      /** Hand the file to the system default app and flag it so FilePreview
+       *  shows an "opened externally" notice instead of an error. */
+      const openExternally = () => {
+        if (get().selectedFile !== path) return;
+        set({ fileContent: null, isLoadingContent: false, openedExternally: true });
+        bridge.openWithDefaultApp(path).catch(() => {});
+      };
 
       if (BINARY_PREVIEW.has(ext)) {
+        // Images over 50MB are not previewed in-app — open externally.
+        if (IMAGE_EXTS.has(ext)) {
+          try {
+            const size = await bridge.getFileSize(path);
+            if (size > 50 * 1024 * 1024) {
+              openExternally();
+              return;
+            }
+          } catch {
+            // Size check failed — fall through to base64 read below.
+          }
+        }
         // Load binary files as base64 data URL for rendering in webview
         try {
           const dataUrl = await bridge.readFileBase64(path);
           if (get().selectedFile === path) {
             set({ fileContent: dataUrl, isLoadingContent: false });
           }
-        } catch {
-          if (get().selectedFile === path) {
+        } catch (err) {
+          // Rust caps read_file_base64 at 50MB — oversized media can't be
+          // previewed, hand to the system default app instead.
+          if (String(err).includes('too large')) {
+            openExternally();
+          } else if (get().selectedFile === path) {
             set({ fileContent: null, isLoadingContent: false });
           }
         }
@@ -169,8 +198,14 @@ export const useFileStore = create<FileState>()((set, get) => ({
           if (get().selectedFile === path) {
             set({ fileContent: content, isLoadingContent: false });
           }
-        } catch {
-          if (get().selectedFile === path) {
+        } catch (err) {
+          // Non-text files (e.g. .mat) fail UTF-8 decoding, and files over
+          // the 1MB text cap can't be previewed — open with the system
+          // default app instead of showing "// Error loading file".
+          const msg = String(err);
+          if (msg.includes('UTF-8') || msg.includes('too large')) {
+            openExternally();
+          } else if (get().selectedFile === path) {
             set({ fileContent: '// Error loading file', isLoadingContent: false });
           }
         }
@@ -178,9 +213,9 @@ export const useFileStore = create<FileState>()((set, get) => ({
     }
   },
 
-  clearSelection: () => set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null }),
+  clearSelection: () => set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null, openedExternally: false }),
 
-  closePreview: () => set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null }),
+  closePreview: () => set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null, openedExternally: false }),
 
   setPreviewMode: (mode: PreviewMode) => {
     const state = get();
@@ -237,10 +272,10 @@ export const useFileStore = create<FileState>()((set, get) => ({
       ]);
       if (BINARY_PREVIEW.has(ext)) {
         const dataUrl = await bridge.readFileBase64(path);
-        if (get().selectedFile === path) set({ fileContent: dataUrl });
+        if (get().selectedFile === path) set({ fileContent: dataUrl, openedExternally: false });
       } else {
         const content = await bridge.readFileContent(path);
-        if (get().selectedFile === path) set({ fileContent: content });
+        if (get().selectedFile === path) set({ fileContent: content, openedExternally: false });
       }
     } catch {
       // Silently fail — keep existing content

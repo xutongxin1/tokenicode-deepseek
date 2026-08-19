@@ -7,8 +7,6 @@ import { bridge } from '../../lib/tauri-bridge';
 import { isMac } from '../../lib/platform';
 import { useT } from '../../lib/i18n';
 import { startTreeDrag, moveTreeDrag, endTreeDrag } from '../../lib/drag-state';
-import { useChatStore } from '../../stores/chatStore';
-import { useSessionStore } from '../../stores/sessionStore';
 import { FileIcon } from '../shared/FileIcon';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { showToast } from '../shared/Toast';
@@ -35,6 +33,8 @@ interface ContextMenuState {
   y: number;
   path: string;
   isDir: boolean;
+  /** True when the menu was opened on blank tree space (path = project root) */
+  isBlank?: boolean;
 }
 
 interface ContextMenuCallbacks {
@@ -88,7 +88,24 @@ function ContextMenu({ menu, onClose, callbacks }: {
     return () => document.removeEventListener('keydown', handler);
   }, [onClose]);
 
-  const items: MenuItem[] = [
+  const items: MenuItem[] = menu.isBlank ? [
+    // Blank tree space — actions operate on the project root directory
+    {
+      label: t('files.openInFileManager'),
+      icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M2 4h4l2 2h6v7H2V4z" /><path d="M11 10.5l2.5-2.5L11 5.5M13.5 8H8" /></svg>,
+      action: () => { bridge.openWithDefaultApp(menu.path); onClose(); },
+    },
+    {
+      label: t('files.openVscodeShort'),
+      icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M4 3l8 5-8 5V3z" /></svg>,
+      action: () => { bridge.openInVscode(menu.path); onClose(); },
+    },
+    {
+      label: t('files.copyCurrentPath'),
+      icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M5 2H2v12h8v-3" /><path d="M6 6h8v8H6V6z" /></svg>,
+      action: () => { navigator.clipboard.writeText(menu.path); onClose(); },
+    },
+  ] : [
     ...(menu.isDir ? [
       {
         label: t('files.newFile'),
@@ -112,6 +129,14 @@ function ContextMenu({ menu, onClose, callbacks }: {
       icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M5 2H2v12h8v-3" /><path d="M6 6h8v8H6V6z" /></svg>,
       action: () => { callbacks.onCopyPath(menu.path); onClose(); },
     },
+    ...(!menu.isDir ? [{
+      label: t('files.copyDir'),
+      icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M2 4h4l2 2h6v7H2V4z" /></svg>,
+      action: () => {
+        navigator.clipboard.writeText(menu.path.replace(/[\\/][^\\/]*$/, ''));
+        onClose();
+      },
+    }] as MenuItem[] : []),
     ...(!menu.isDir ? [{
       label: t('files.copyFile'),
       icon: <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><rect x="5" y="5" width="9" height="9" rx="1.5" /><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-6A1.5 1.5 0 013.5 2h6A1.5 1.5 0 0111 3.5V5" /></svg>,
@@ -255,7 +280,7 @@ function SearchResultItem({
           }
         }
       }}
-      onContextMenu={(e) => { e.preventDefault(); onContextMenu(e, node.path, node.is_dir); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onContextMenu(e, node.path, node.is_dir); }}
       className={`w-full flex items-center gap-2 py-1.5 px-3 rounded-lg
         text-left text-[13px] transition-smooth group
         ${isSelected
@@ -394,6 +419,7 @@ function TreeNode({
         }}
         onContextMenu={(e) => {
           e.preventDefault();
+          e.stopPropagation();
           onContextMenu(e, node.path, node.is_dir);
         }}
         {...(node.is_dir ? { 'data-dir-path': node.path } : {})}
@@ -537,6 +563,14 @@ export function FileExplorer() {
     setContextMenu({ x: e.clientX, y: e.clientY, path, isDir });
   }, []);
 
+  // Right-click on blank tree space — menu acts on the project root directory
+  const handleBlankContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const dir = workingDirectory || rootPath;
+    if (!dir) return;
+    setContextMenu({ x: e.clientX, y: e.clientY, path: dir, isDir: true, isBlank: true });
+  }, [workingDirectory, rootPath]);
+
   const closeContextMenu = useCallback(() => {
     setContextMenu(null);
   }, []);
@@ -609,12 +643,12 @@ export function FileExplorer() {
   }, [deleteTarget, refreshTree]);
 
   const handleInsertToChat = useCallback((path: string) => {
-    const tabId = useSessionStore.getState().selectedSessionId;
-    if (!tabId) return;
-    const tab = useChatStore.getState().getTab(tabId);
-    const currentDraft = tab?.inputDraft ?? '';
-    const prefix = currentDraft && !currentDraft.endsWith('\n') && !currentDraft.endsWith(' ') ? ' ' : '';
-    useChatStore.getState().setInputDraft(tabId, currentDraft + prefix + '"' + path + '"');
+    // Route through the same inline-insert channel as drag-drop: the input
+    // editor inserts the path at the last known cursor position instead of
+    // blindly appending to the end of the draft.
+    window.dispatchEvent(
+      new CustomEvent('tokenicode:tree-file-inline', { detail: path }),
+    );
   }, []);
 
   const handleNewFile = useCallback((dir: string) => {
@@ -803,7 +837,8 @@ export function FileExplorer() {
       </div>
 
       {/* File tree */}
-      <div className="flex-1 min-h-0 relative" data-file-tree>
+      <div className="flex-1 min-h-0 relative" data-file-tree
+        onContextMenu={handleBlankContextMenu}>
         {isDragOverTree && (
           <div className="absolute inset-0 z-10 border-2 border-dashed border-accent
             bg-accent/5 rounded-lg flex items-center justify-center pointer-events-none">

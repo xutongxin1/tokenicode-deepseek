@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { type ChatMessage, useChatStore, getActiveTabState } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { bridge } from '../../lib/tauri-bridge';
@@ -35,9 +35,31 @@ export function QuestionCard({ message, floating }: Props) {
   const [otherText, setOtherText] = useState<Record<number, string>>({});
   const [useOther, setUseOther] = useState<Record<number, boolean>>({});
   const [answeredMap, setAnsweredMap] = useState<Record<number, string>>({});
+  // Collapsed by default once resolved — expand to review the full Q&A.
+  const [expanded, setExpanded] = useState(false);
+  // Which question's option list is expanded inside the Q&A record
+  // (per-question collapse: users rarely want every option list open).
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
 
   const currentQ = questions[currentIdx];
   const isFullyResolved = message.resolved;
+
+  // Reset per-message UI state when the card is reused for another message
+  useEffect(() => {
+    setExpanded(false);
+    setExpandedIdx(null);
+  }, [message.id]);
+
+  // Question → answer pairs for the resolved/collapsed record. Prefer the
+  // persisted answers (survive tab switches + history reload); fall back to
+  // the in-memory answeredMap for the live interaction.
+  const answeredPairs = questions
+    .map((q, i) => ({
+      q: decodeUnicodeEscapes(q.question),
+      a: decodeUnicodeEscapes(message.questionAnswers?.[q.question] ?? answeredMap[i] ?? ''),
+      options: q.options || [],
+    }))
+    .filter((p) => p.a);
 
   const handleToggle = useCallback((optIdx: number, multi: boolean) => {
     if (isFullyResolved) return;
@@ -101,10 +123,13 @@ export function QuestionCard({ message, floating }: Props) {
     if (isLast) {
       const qTabId = useSessionStore.getState().selectedSessionId;
       if (!qTabId) return;
-      const { setInteractionState, setSessionStatus, setActivityStatus } = useChatStore.getState();
+      const { setInteractionState, setQuestionAnswers, setSessionStatus, setActivityStatus } = useChatStore.getState();
       const stdinId = getActiveTabState().sessionMeta.stdinId;
       if (!stdinId) return;
       const answers = buildAskUserQuestionAnswers(questions, selectedMap, otherText, useOther);
+      // Persist the Q&A record on the message so the resolved card (and
+      // reloaded history) can show a collapsible "question → answer" view.
+      setQuestionAnswers(qTabId, message.id, answers);
       setInteractionState(qTabId, message.id, 'sending');
       try {
         const permData = message.permissionData;
@@ -151,8 +176,9 @@ export function QuestionCard({ message, floating }: Props) {
           : 'border-l-[3px] border-l-accent border-r border-t border-b border-r-accent/15 border-t-accent/15 border-b-accent/15 bg-gradient-to-r from-accent/[0.03] to-transparent'
         }`}>
 
-        {/* Already answered questions — timeline view */}
-        {Object.keys(answeredMap).length > 0 && (
+        {/* Already answered questions — timeline view (live interaction only;
+            once resolved the collapsible Q&A record below takes over) */}
+        {!isFullyResolved && Object.keys(answeredMap).length > 0 && (
           <div className="px-3 pt-2 pb-1 space-y-1">
             {Object.entries(answeredMap).map(([idxStr, answer]) => {
               const qIdx = Number(idxStr);
@@ -178,8 +204,131 @@ export function QuestionCard({ message, floating }: Props) {
           </div>
         )}
 
-        {/* Resolved state — show all answers */}
-        {isFullyResolved && Object.keys(answeredMap).length === 0 && (
+        {/* Resolved state — collapsible Q&A record. Collapsed by default:
+            one-line summary (first question → answer), expandable to the
+            full list so the user can review how they answered each question. */}
+        {isFullyResolved && answeredPairs.length > 0 && (
+          <div className="px-3 py-2">
+            <button
+              onClick={() => setExpanded((v) => !v)}
+              className="w-full flex items-center gap-2 text-left
+                cursor-pointer group"
+              title={expanded ? t('msg.qaCollapse') : t('msg.qaExpand')}
+            >
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
+                stroke="currentColor" strokeWidth="1.5"
+                strokeLinecap="round" strokeLinejoin="round"
+                className={`flex-shrink-0 text-text-tertiary transition-transform
+                  duration-150 ${expanded ? 'rotate-90' : ''}`}>
+                <path d="M3 1.5L7 5l-4 3.5" />
+              </svg>
+              <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
+                stroke="currentColor" strokeWidth="1.5" className="text-success flex-shrink-0">
+                <path d="M2.5 6l2.5 2.5 4.5-4.5" />
+              </svg>
+              <span className="text-xs text-text-muted min-w-0 truncate flex-1">
+                <span className="text-text-secondary">{answeredPairs[0].q}</span>
+                {' → '}
+                <span className="text-text-primary font-medium">{answeredPairs[0].a}</span>
+              </span>
+              {answeredPairs.length > 1 && (
+                <span className="flex-shrink-0 px-1.5 py-0.5 rounded
+                  bg-bg-tertiary text-[10px] text-text-tertiary font-medium">
+                  +{answeredPairs.length - 1}
+                </span>
+              )}
+            </button>
+
+            {/* Expanded full Q&A list — each question collapses further to
+                show the option list that was offered at the time */}
+            {expanded && (
+              <div className="mt-2 space-y-1 border-t border-border-subtle pt-2">
+                {answeredPairs.map((p, i) => {
+                  const itemExpanded = expandedIdx === i;
+                  const selectedLabels = p.a.split(', ').map((s) => s.trim());
+                  return (
+                    <div key={i}>
+                      <div className="flex items-start gap-2">
+                        <div className="flex flex-col items-center flex-shrink-0 mt-1">
+                          <div className="w-1.5 h-1.5 rounded-full bg-success" />
+                          {i < answeredPairs.length - 1 && (
+                            <div className="w-px h-3 bg-border-subtle mt-0.5" />
+                          )}
+                        </div>
+                        <button
+                          onClick={() => setExpandedIdx(itemExpanded ? null : i)}
+                          className="flex-1 min-w-0 flex items-start gap-1.5 text-left
+                            cursor-pointer group"
+                          title={p.options.length > 0
+                            ? (itemExpanded ? t('msg.qaCollapse') : t('msg.qaOptionsHint'))
+                            : undefined}
+                        >
+                          <span className="text-xs text-text-muted min-w-0 leading-relaxed">
+                            <span className="text-text-secondary">{p.q}</span>
+                            {' → '}
+                            <span className="text-text-primary font-medium">{p.a}</span>
+                          </span>
+                          {p.options.length > 0 && (
+                            <span className="flex-shrink-0 flex items-center gap-0.5
+                              mt-0.5 text-[10px] text-text-tertiary
+                              group-hover:text-text-secondary transition-colors">
+                              <svg width="8" height="8" viewBox="0 0 10 10" fill="none"
+                                stroke="currentColor" strokeWidth="1.5"
+                                strokeLinecap="round" strokeLinejoin="round"
+                                className={`transition-transform duration-150 ${itemExpanded ? 'rotate-90' : ''}`}>
+                                <path d="M3 1.5L7 5l-4 3.5" />
+                              </svg>
+                              {p.options.length}{t('msg.qaOptions')}
+                            </span>
+                          )}
+                        </button>
+                      </div>
+
+                      {/* Per-question option list (collapsed by default) */}
+                      {itemExpanded && p.options.length > 0 && (
+                        <div className="ml-4 mt-1.5 space-y-1">
+                          {p.options.map((opt, oi) => {
+                            const isSelected = selectedLabels.includes(
+                              decodeUnicodeEscapes(opt.label),
+                            );
+                            return (
+                              <div key={oi} className={`flex items-start gap-1.5 text-[11px]
+                                px-2 py-1 rounded-lg
+                                ${isSelected
+                                  ? 'bg-accent/10 text-accent'
+                                  : 'text-text-tertiary'}`}>
+                                <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
+                                  stroke="currentColor" strokeWidth="1.5"
+                                  className={`flex-shrink-0 mt-0.5 ${isSelected ? 'text-accent' : 'opacity-40'}`}>
+                                  {isSelected
+                                    ? <path d="M2.5 6l2.5 2.5 4.5-4.5" />
+                                    : <circle cx="6" cy="6" r="4" />}
+                                </svg>
+                                <span className="min-w-0 leading-relaxed">
+                                  <span className={isSelected ? 'font-medium' : ''}>
+                                    {decodeUnicodeEscapes(opt.label)}
+                                  </span>
+                                  {opt.description && (
+                                    <span className="text-text-tertiary ml-1.5">
+                                      {'—'} {decodeUnicodeEscapes(opt.description)}
+                                    </span>
+                                  )}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Resolved state — no answer record available */}
+        {isFullyResolved && answeredPairs.length === 0 && (
           <div className="flex items-center gap-1.5 px-3 py-2">
             <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
               stroke="currentColor" strokeWidth="1.5" className="text-success">

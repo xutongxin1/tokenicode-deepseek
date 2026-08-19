@@ -112,6 +112,10 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
 
     const wrapperRef = useRef<HTMLDivElement>(null);
     const composingRef = useRef(false);
+    // Last cursor position while the editor had focus — external insertions
+    // (file tree "insert path", paste/drag of paths) restore this instead of
+    // appending to the end of the document.
+    const savedSelectionRef = useRef<{ from: number; to: number } | null>(null);
     const onUpdateRef = useRef(onUpdate);
     onUpdateRef.current = onUpdate;
 
@@ -161,6 +165,12 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
         if (composingRef.current) return;
         const text = editorToPlainText(ed);
         onUpdateRef.current?.(text);
+      },
+      onBlur: ({ editor: ed }) => {
+        savedSelectionRef.current = {
+          from: ed.state.selection.from,
+          to: ed.state.selection.to,
+        };
       },
     });
 
@@ -232,7 +242,16 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
       insertTextAtCursor(text: string) {
         if (!editor) return;
         editor.commands.focus();
-        editor.chain().insertContent(text).run();
+        // Restore the cursor position from before the editor lost focus —
+        // clicking in the file tree blurs the editor, after which a plain
+        // insertContent would land at the end of the document instead of
+        // where the user was last editing.
+        const saved = savedSelectionRef.current;
+        if (saved && saved.from <= editor.state.doc.content.size && saved.to <= editor.state.doc.content.size) {
+          editor.chain().focus().setTextSelection(saved).insertContent(text).run();
+        } else {
+          editor.chain().insertContent(text).run();
+        }
       },
       isEmpty() {
         return editor?.isEmpty ?? true;

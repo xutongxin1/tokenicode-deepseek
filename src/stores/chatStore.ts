@@ -62,6 +62,9 @@ export interface ChatMessage {
   planContent?: string;            // markdown content for plan_review
   // AskUserQuestion fields
   questions?: UserQuestion[];      // question data from AskUserQuestion tool
+  /** User's answers keyed by question text — persisted so answered
+   *  questions render a collapsible Q&A record even after history reload. */
+  questionAnswers?: Record<string, string>;
   // TodoWrite fields
   todoItems?: TodoItem[];          // todo list items
   // File attachments (user-sent images/files)
@@ -214,6 +217,8 @@ interface ChatState {
   clearPendingMessages: (tabId: string) => void;
   rewindToTurn: (tabId: string, startMsgIdx: number) => void;
   setInteractionState: (tabId: string, msgId: string, state: InteractionState, error?: string) => void;
+  /** Persist the user's answers to an AskUserQuestion card (keyed by question text). */
+  setQuestionAnswers: (tabId: string, msgId: string, answers: Record<string, string>) => void;
   getActiveInteraction: (tabId: string) => ChatMessage | undefined;
 
   // --- Tab lifecycle ---
@@ -542,6 +547,17 @@ export const useChatStore = create<ChatState>()((set, get) => ({
             interactionError: error,
             resolved: interactionState === 'resolved',
           } : m,
+        ),
+      }));
+      return result ?? {};
+    }),
+
+  setQuestionAnswers: (tabId, msgId, answers) =>
+    set((state) => {
+      const result = updateTab(state.tabs, tabId, (tab) => ({
+        ...tab,
+        messages: tab.messages.map((m) =>
+          m.id === msgId ? { ...m, questionAnswers: answers } : m,
         ),
       }));
       return result ?? {};

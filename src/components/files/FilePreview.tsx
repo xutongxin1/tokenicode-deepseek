@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
+import { useMemo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import CodeMirror from '@uiw/react-codemirror';
 import { javascript } from '@codemirror/lang-javascript';
@@ -41,6 +41,206 @@ function getExt(path: string): string {
 
 function getFileName(path: string): string {
   return path.split(/[\\/]/).pop() || path;
+}
+
+/**
+ * ImagePreview — wheel-zoomable image view for the file preview panel.
+ *
+ * Plain wheel zooms (no Ctrl) around the fitted size; when zoomed in, the
+ * container exposes scrollbars to pan — and the image can be dragged with
+ * the mouse to pan as well. −/%/+ buttons bottom-right provide an explicit
+ * affordance. Zoom resets when the image changes.
+ */
+function ImagePreview({ src, alt }: { src: string; alt: string }) {
+  const t = useT();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  const [box, setBox] = useState({ w: 0, h: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [dragging, setDragging] = useState(false);
+  // Drag-to-pan state: anchor scroll offsets when the drag started
+  const dragRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+  // The zoom value the DOM currently reflects (state may be ahead of the DOM
+  // when several wheel events coalesce into one render).
+  const renderedZoomRef = useRef(1);
+  // Pending zoom-to-cursor anchor: image-space point under the cursor plus
+  // the cursor position in container coordinates, captured at wheel time.
+  const anchorRef = useRef<{ x: number; y: number; px: number; py: number; factor: number } | null>(null);
+
+  // New image → reset zoom and re-measure natural size
+  useEffect(() => {
+    anchorRef.current = null;
+    setZoom(1);
+    setNatural(null);
+  }, [src]);
+
+  // Track the scroll container size (p-4 padding excluded from the fit box)
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const update = () => setBox({ w: el.clientWidth - 32, h: el.clientHeight - 32 });
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const zoomBy = useCallback((factor: number) => {
+    setZoom((z) => Math.min(8, Math.max(0.2, z * factor)));
+  }, []);
+
+  // Fit natural size into the available box without upscaling (same
+  // behavior as max-w-full max-h-full object-contain)
+  const fit = useMemo(() => {
+    if (!natural || box.w <= 0 || box.h <= 0) return null;
+    const k = Math.min(1, box.w / natural.w, box.h / natural.h);
+    return { w: natural.w * k, h: natural.h * k };
+  }, [natural, box]);
+
+  // Native wheel listener — React's root wheel listener is passive, so a
+  // plain onWheel prop couldn't preventDefault the container scroll.
+  // Zoom anchors on the pointer: the image point under the cursor stays
+  // under the cursor after the zoom (zoom-to-cursor, not center zoom).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (!fit) return;
+      const img = imgRef.current;
+      if (!img) return;
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const oldZoom = renderedZoomRef.current;
+      const newZoom = Math.min(8, Math.max(0.2, oldZoom * factor));
+      if (newZoom === oldZoom) return;
+      // Cursor position relative to the scroll container (border box; there
+      // is no border, so this matches the scroll origin at the padding box).
+      const rect = el.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      // Image-space point currently under the cursor. offsetLeft/Top are
+      // relative to the offsetParent (this absolutely-positioned container),
+      // same origin as scrollLeft/Top.
+      anchorRef.current = {
+        x: el.scrollLeft + px - img.offsetLeft,
+        y: el.scrollTop + py - img.offsetTop,
+        px,
+        py,
+        factor: newZoom / oldZoom,
+      };
+      renderedZoomRef.current = newZoom;
+      setZoom(newZoom);
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [fit]);
+
+  // After a wheel zoom re-renders the image at its new size, adjust the
+  // scroll offsets so the anchored image point stays under the cursor.
+  // useLayoutEffect keeps this inside the same frame — no visible jump.
+  useLayoutEffect(() => {
+    renderedZoomRef.current = zoom;
+    const a = anchorRef.current;
+    const el = scrollRef.current;
+    const img = imgRef.current;
+    if (!a || !el || !img) return;
+    anchorRef.current = null;
+    el.scrollLeft = img.offsetLeft + a.x * a.factor - a.px;
+    el.scrollTop = img.offsetTop + a.y * a.factor - a.py;
+  }, [zoom]);
+
+  const size = fit ? { width: fit.w * zoom, height: fit.h * zoom } : undefined;
+
+  // Whether the image actually overflows the viewport (drag-pan only makes
+  // sense then; grab cursor only shown then too).
+  const canPan = !!fit && !!size &&
+    (size.width > box.w || size.height > box.h);
+
+  // Drag-to-pan: track the pointer and shift the scroll offsets.
+  const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    dragRef.current = { x: e.clientX, y: e.clientY, left: el.scrollLeft, top: el.scrollTop };
+    setDragging(true);
+  }, []);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e: PointerEvent) => {
+      const el = scrollRef.current;
+      const d = dragRef.current;
+      if (!el || !d) return;
+      el.scrollLeft = d.left - (e.clientX - d.x);
+      el.scrollTop = d.top - (e.clientY - d.y);
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      setDragging(false);
+    };
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+    return () => {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    };
+  }, [dragging]);
+
+  return (
+    <div className="relative h-full">
+      <div
+        ref={scrollRef}
+        className={`absolute inset-0 overflow-auto flex p-4 select-none
+          ${dragging ? 'cursor-grabbing' : canPan ? 'cursor-grab' : ''}`}
+        onPointerDown={onPointerDown}
+      >
+        <img
+          ref={imgRef}
+          src={src}
+          alt={alt}
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            if (img.naturalWidth > 0) {
+              setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+            }
+          }}
+          style={size}
+          className={`m-auto rounded select-none shrink-0
+            ${size ? 'max-w-none' : 'max-w-full max-h-full object-contain'}`}
+          draggable={false}
+        />
+      </div>
+
+      {/* Zoom controls — wheel zooms too */}
+      <div className="absolute bottom-3 right-3 flex items-center gap-1 z-10">
+        <button
+          onClick={() => zoomBy(1 / 1.25)}
+          className="w-7 h-7 rounded-lg bg-black/60 hover:bg-black/80
+            text-white/80 text-sm transition-smooth cursor-pointer"
+          title={t('img.zoomOut')}
+        >
+          −
+        </button>
+        <button
+          onClick={() => setZoom(1)}
+          className="px-2 h-7 min-w-[52px] rounded-lg bg-black/60 hover:bg-black/80
+            text-white/80 text-xs transition-smooth cursor-pointer"
+          title={t('img.resetZoom')}
+        >
+          {Math.round(zoom * 100)}%
+        </button>
+        <button
+          onClick={() => zoomBy(1.25)}
+          className="w-7 h-7 rounded-lg bg-black/60 hover:bg-black/80
+            text-white/80 text-sm transition-smooth cursor-pointer"
+          title={t('img.zoomIn')}
+        >
+          +
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /** Return CodeMirror language extension for the given file extension */
@@ -150,6 +350,7 @@ export function FilePreview() {
   const selectedFile = useFileStore((s) => s.selectedFile);
   const fileContent = useFileStore((s) => s.fileContent);
   const isLoadingContent = useFileStore((s) => s.isLoadingContent);
+  const openedExternally = useFileStore((s) => s.openedExternally);
   const previewMode = useFileStore((s) => s.previewMode);
   const setPreviewMode = useFileStore((s) => s.setPreviewMode);
   const closePreview = useFileStore((s) => s.closePreview);
@@ -259,6 +460,9 @@ export function FilePreview() {
 
   /* Mode tabs for the header */
   const modeTabs = useMemo(() => {
+    // No tabs for files handed off to the system app — there is nothing
+    // in-app to preview or edit.
+    if (openedExternally) return [];
     if (isMarkdown) {
       // Markdown — preview + edit only
       return [
@@ -281,12 +485,14 @@ export function FilePreview() {
       ];
     }
     return [];
-  }, [hasPreview, isMarkdown, isBinary, isImage, t]);
+  }, [hasPreview, isMarkdown, isBinary, isImage, isPdf, isVideo, isAudio, openedExternally, t]);
 
   if (!selectedFile) return null;
 
   return (
-    <div className="flex flex-col h-full bg-bg-primary" onKeyDown={handleKeyDown}>
+    // relative z-10: the skin-theme decor (fixed, z-index 1) must not float
+    // over the preview content (images/text) — the opaque panel covers it.
+    <div className="flex flex-col h-full bg-bg-primary relative z-10" onKeyDown={handleKeyDown}>
       {/* Header bar — pt-6 for macOS traffic lights, z-10 above iframe content */}
       <div className="flex items-center justify-between px-3 pt-6 pb-2
         border-b border-border-subtle bg-bg-secondary/50 flex-shrink-0 relative z-10">
@@ -403,16 +609,31 @@ export function FilePreview() {
               {t('files.loading')}
             </div>
           </div>
-        ) : isImage && selectedFile && fileContent ? (
-          /* Image preview: use base64 data URL from Rust backend */
-          <div className="flex items-center justify-center h-full p-4 overflow-auto">
-            <img
-              src={fileContent}
-              alt={fileName}
-              className="max-w-full max-h-full object-contain rounded"
-              draggable={false}
-            />
+        ) : openedExternally && selectedFile ? (
+          /* Oversized image / non-text file — was handed to the system
+             default app instead of previewing in-app */
+          <div className="flex items-center justify-center h-full">
+            <div className="text-center space-y-3">
+              <FileIcon name={fileName} size={40} className="text-text-tertiary" />
+              <div className="text-xs text-text-muted">{t('files.openedExternally')}</div>
+              <button
+                onClick={() => bridge.openWithDefaultApp(selectedFile)}
+                className="px-3 py-1.5 text-xs rounded-lg bg-bg-secondary
+                  text-text-muted hover:bg-bg-tertiary hover:text-text-primary
+                  transition-smooth cursor-pointer inline-flex items-center gap-1.5"
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+                  stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                  <path d="M10 6.5v3a1 1 0 01-1 1H2.5a1 1 0 01-1-1V3a1 1 0 011-1H6" />
+                  <path d="M7.5 1.5h3v3M7 5.5l3.5-4" />
+                </svg>
+                {t('files.openDefault')}
+              </button>
+            </div>
           </div>
+        ) : isImage && selectedFile && fileContent ? (
+          /* Image preview: base64 data URL; wheel zoom + scroll pan when zoomed */
+          <ImagePreview src={fileContent} alt={fileName} />
         ) : isPdf && selectedFile && fileContent ? (
           /* PDF preview: iframe with base64 data URL */
           <div className="flex flex-col h-full">
@@ -551,12 +772,14 @@ export function FilePreview() {
             </div>
           </div>
         ) : fileContent !== null ? (
-          /* Source view: read-only CodeMirror */
+          /* Source view: read-only CodeMirror.
+             Note: readOnly=true only (no editable=false) — editable=false
+             sets contenteditable=false which also disables text selection,
+             making the preview impossible to copy from. */
           <CodeMirror
             value={fileContent}
             extensions={[...(Array.isArray(langExtension) ? langExtension : [langExtension]), EditorView.lineWrapping, tokenicodeHighlight]}
             theme={tokenicodeTheme}
-            editable={false}
             readOnly={true}
             height="100%"
             style={{ height: '100%', fontSize: '13px' }}

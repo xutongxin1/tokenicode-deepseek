@@ -204,7 +204,22 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
             if (block.tool_use_id && resultText) {
               const idx = toolUseIdToIndex.get(block.tool_use_id);
               if (idx !== undefined && messages[idx]) {
-                messages[idx] = { ...messages[idx], toolResultContent: resultText };
+                const update: Partial<ChatMessage> = { toolResultContent: resultText };
+                // AskUserQuestion results carry the user's answers as JSON:
+                // {"answers": {"<question text>": "<answer>"}}. Persist them
+                // so the resolved card renders the collapsible Q&A record.
+                if (messages[idx].type === 'question') {
+                  try {
+                    const parsed = JSON.parse(resultText);
+                    if (parsed && typeof parsed === 'object' && parsed.answers
+                      && typeof parsed.answers === 'object') {
+                      update.questionAnswers = parsed.answers as Record<string, string>;
+                    }
+                  } catch {
+                    // Not JSON — keep the raw result text, no answers parsed.
+                  }
+                }
+                messages[idx] = { ...messages[idx], ...update };
               }
             }
           } else if (block.type === 'thinking') {
