@@ -1,4 +1,4 @@
-name: Build EXE + Auto Release
+name: Build Windows Release (from xtx)
 
 on:
   workflow_dispatch:
@@ -21,6 +21,9 @@ permissions:
   contents: write
 
 jobs:
+  # One job, one `tauri build` — the release .exe, .msi and .nsis installer
+  # are all products of the same build, so separate jobs would compile twice
+  # for nothing. All assets land in a single GitHub Release.
   build-and-release:
     runs-on: windows-latest
 
@@ -41,25 +44,33 @@ jobs:
             TAG_VER="dev-$(date +%Y%m%d-%H%M)"
           fi
           # semver-safe version string for tauri.conf.json / Cargo.toml
-          # must be MAJOR.MINOR.PATCH[-prerelease]
-          SEMVER="0.0.0-dev"
+          # must be MAJOR.MINOR.PATCH[-prerelease]; the msi (WiX) target
+          # requires the pre-release identifier to be numeric-only and <= 65535,
+          # so "0.0.0-dev" fails bundling — use "0.0.0-1" instead.
+          SEMVER="0.0.0-1"
+          # Build timestamp (Asia/Shanghai) shown in the window title
+          BUILD_TS="$(TZ=Asia/Shanghai date +%Y%m%d%H%M)"
           echo "tag=$TAG_VER" >> $GITHUB_OUTPUT
           echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+          echo "build_ts=$BUILD_TS" >> $GITHUB_OUTPUT
           echo "release_name=TOKENICODE-from-xtx $TAG_VER" >> $GITHUB_OUTPUT
 
       # -- inject "from xtx" branding into config ---------------------------
       - name: Patch branding into configs
         shell: bash
         run: |
-          # 1. tauri.conf.json — product name + window title
+          # 1. tauri.conf.json — product name + window title.
+          #    plugins.updater is removed: this is a standalone build without
+          #    update checks (lib.rs only registers the updater plugin when the
+          #    config section exists, so this cannot crash at startup).
           node -e "
           const fs = require('fs');
           const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8'));
           conf.productName = 'TOKENICODE-from-xtx';
           conf.version = '${{ steps.version.outputs.semver }}';
-          conf.app.windows[0].title = 'TOKENICODE from xtx';
+          conf.app.windows[0].title = 'TOKENICODE from xtx ${{ steps.version.outputs.build_ts }}';
           conf.bundle.createUpdaterArtifacts = false;
-          conf.bundle.windows = { ...(conf.bundle.windows || {}), nsis: { installMode: 'currentUser' } };
+          delete conf.plugins.updater;
           fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2));
           console.log('tauri.conf.json patched:', conf.productName, conf.version);
           "
@@ -97,18 +108,17 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build (Windows EXE + MSI)
+      - name: Build (EXE + MSI + NSIS)
         shell: bash
         env:
           EDITION: dev
         run: |
-          # first attempt: full build
-          # if NSIS download times out, the .exe + .msi are already built
+          # NSIS download may time out; the .exe and .msi are already built by then
           pnpm tauri build --bundles msi,nsis 2>&1 || true
 
           echo "--- built artifacts ---"
           ls -lh src-tauri/target/release/tokenicode.exe
-          ls -lh src-tauri/target/release/bundle/msi/  2>/dev/null || echo "(no msi)"
+          ls -lh src-tauri/target/release/bundle/msi/ 2>/dev/null || echo "(no msi)"
           ls -lh src-tauri/target/release/bundle/nsis/ 2>/dev/null || echo "(no nsis)"
 
       # -- prepare release assets -------------------------------------------
@@ -119,25 +129,25 @@ jobs:
           mkdir -p release-assets
           VER="${{ steps.version.outputs.tag }}"
 
-          # standalone exe
+          # standalone exe (same binary as the installer payload, no installer)
           EXE="src-tauri/target/release/tokenicode.exe"
           if [ -f "$EXE" ]; then
-            cp "$EXE" "release-assets/TOKENICODE-from-xtx_${VER}_x64.exe"
+            cp "$EXE" "release-assets/TOKENICODE-from-xtx-standalone.exe"
           fi
 
           # msi installer
           MSI_DIR="src-tauri/target/release/bundle/msi"
           if [ -d "$MSI_DIR" ]; then
             for f in "$MSI_DIR"/*.msi; do
-              [ -f "$f" ] && cp "$f" "release-assets/TOKENICODE-from-xtx_${VER}_x64.msi"
+              [ -f "$f" ] && cp "$f" "release-assets/"
             done
           fi
 
-          # nsis installer (may not exist if download failed)
+          # nsis installer (may not exist if NSIS download failed)
           NSIS_DIR="src-tauri/target/release/bundle/nsis"
           if [ -d "$NSIS_DIR" ]; then
             for f in "$NSIS_DIR"/*.exe; do
-              [ -f "$f" ] && cp "$f" "release-assets/TOKENICODE-from-xtx_${VER}_x64-setup.exe"
+              [ -f "$f" ] && cp "$f" "release-assets/"
             done
           fi
 
@@ -159,11 +169,11 @@ jobs:
 
             **版本**: `${{ steps.version.outputs.tag }}`
             **平台**: Windows x64
-            **构建时间**: ${{ github.event.head_commit.timestamp || 'manual' }}
 
             ### 📦 包含文件
-            - `TOKENICODE-from-xtx_*.exe` — 独立可执行文件 (22MB, 免安装直接运行)
-            - `TOKENICODE-from-xtx_*.msi` — Windows 安装包
+            - `TOKENICODE-from-xtx-standalone.exe` — 独立可执行文件，免安装直接运行
+            - `*.msi` — Windows 安装包
+            - `*-setup.exe` — NSIS 安装程序（NSIS 下载失败时缺失）
 
             > 🏷️ 此版本由 GitHub Actions 自动构建，from xtx。
           draft: ${{ inputs.draft || false }}
@@ -172,13 +182,3 @@ jobs:
           fail_on_unmatched_files: ${{ steps.gather.outputs.asset_count != '0' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # -- summary ----------------------------------------------------------
-      - name: Summary
-        shell: bash
-        run: |
-          echo "============================================"
-          echo "  Release: ${{ steps.version.outputs.release_name }}"
-          echo "  Tag:     ${{ steps.version.outputs.tag }}"
-          echo "  Assets:  $(ls release-assets/ | wc -l) files"
-          echo "============================================"
