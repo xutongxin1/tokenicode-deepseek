@@ -13,6 +13,7 @@ import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
 import { FileUploadChips } from './FileUploadChips';
 import { RewindPanel } from './RewindPanel';
+import { GitStatusBar } from './GitStatusBar';
 import { useFileAttachments } from '../../hooks/useFileAttachments';
 import { useRewind } from '../../hooks/useRewind';
 import { useStreamProcessor, flushStreamBuffer } from '../../hooks/useStreamProcessor';
@@ -1849,6 +1850,9 @@ export function InputBar() {
               <span className="text-[10px]">{t('rewind.title')}</span>
             </button>
           )}
+
+          {/* Git working-tree status — posh-git style, next to rewind */}
+          <GitStatusBar />
 
           {/* Spacer */}
           <div className="flex-1" />
