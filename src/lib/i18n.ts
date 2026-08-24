@@ -658,6 +658,16 @@ const messages: Record<Locale, Record<string, string>> = {
     'mcp.commandPlaceholder': '输入命令，如 npx',
     'mcp.refresh': '刷新',
     'mcp.envCount': '个环境变量',
+    'mcp.transport': '传输方式',
+    'mcp.transportStdio': 'Stdio',
+    'mcp.transportHttp': 'HTTP',
+    'mcp.url': 'URL',
+    'mcp.urlPlaceholder': 'http://127.0.0.1:23120/mcp',
+    'mcp.headers': 'Headers',
+    'mcp.headersHint': '每行一个，格式: KEY=VALUE',
+    'mcp.ping': '检测连接',
+    'mcp.pingSuccess': '连接正常',
+    'mcp.pingFailed': '连接失败',
 
     // CLI Management
     'cli.check': '检查 CLI 状态',
@@ -1423,6 +1433,16 @@ const messages: Record<Locale, Record<string, string>> = {
     'mcp.commandPlaceholder': 'Enter command, e.g. npx',
     'mcp.refresh': 'Refresh',
     'mcp.envCount': 'env vars',
+    'mcp.transport': 'Transport',
+    'mcp.transportStdio': 'Stdio',
+    'mcp.transportHttp': 'HTTP',
+    'mcp.url': 'URL',
+    'mcp.urlPlaceholder': 'http://127.0.0.1:23120/mcp',
+    'mcp.headers': 'Headers',
+    'mcp.headersHint': 'One per line, format: KEY=VALUE',
+    'mcp.ping': 'Ping',
+    'mcp.pingSuccess': 'Connected',
+    'mcp.pingFailed': 'Connection failed',
 
     // CLI Management
     'cli.check': 'Check CLI Status',

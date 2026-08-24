@@ -202,6 +202,24 @@ export interface ConnectionTestResult {
   model: StepResult;
 }
 
+export interface McpPingConfig {
+  type: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
+export interface McpPingResult {
+  ok: boolean;
+  latencyMs: number;
+  serverName: string | null;
+  serverVersion: string | null;
+  protocolVersion: string | null;
+  error: string | null;
+}
+
 export interface SetupOutputEvent {
   stream: 'stdout' | 'stderr';
   line: string;
@@ -608,6 +626,10 @@ export const bridge = {
 
   testProviderConnection: (baseUrl: string, apiFormat: string, apiKey: string, model: string, proxyUrl?: string) =>
     invoke<ConnectionTestResult>('test_provider_connection', { baseUrl, apiFormat, apiKey, model, proxyUrl: proxyUrl || null }),
+
+  /** Ping an MCP server (stdio: spawn + JSON-RPC handshake; http/sse: POST initialize). */
+  pingMcpServer: (config: McpPingConfig) =>
+    invoke<McpPingResult>('ping_mcp_server', { config }),
 
 
   // --- SDK Control Protocol ---

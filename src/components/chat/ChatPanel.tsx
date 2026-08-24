@@ -551,8 +551,15 @@ export function ChatPanel() {
   const thinkingPreRef = useRef<HTMLPreElement>(null);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const isNearBottomRef = useRef(true);
-  // When user scrolls up via wheel, suppress auto-scroll until they return to bottom
+  // When user scrolls up, suppress auto-scroll until they return to bottom
   const userScrollingUpRef = useRef(false);
+  // Previous scrollTop for detecting upward movement from ANY scroll source
+  // (wheel, scrollbar drag, keyboard). Only meaningful while streaming.
+  const lastScrollTopRef = useRef(0);
+  const isStreamingRef = useRef(false);
+  useEffect(() => {
+    isStreamingRef.current = isStreaming;
+  }, [isStreaming]);
   // Show "scroll to bottom" button when user is far from bottom
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const showScrollBtnRef = useRef(false);
@@ -610,6 +617,17 @@ export function ChatPanel() {
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
+    // Detect genuine upward movement from ANY scroll source (wheel, scrollbar
+    // drag, keyboard PgUp/Home/arrows) while streaming, so the user isn't
+    // yanked back down while reading earlier content. Gated on streaming to
+    // avoid false positives when the browser clamps scrollTop after content
+    // shrinks (e.g. session switch). Programmatic pinning only ever increases
+    // scrollTop, so it can't trip this.
+    const prevTop = lastScrollTopRef.current;
+    if (isStreamingRef.current && el.scrollTop < prevTop - 2) {
+      userScrollingUpRef.current = true;
+    }
+    lastScrollTopRef.current = el.scrollTop;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     isNearBottomRef.current = nearBottom;
     if (nearBottom) {
@@ -720,11 +738,13 @@ export function ChatPanel() {
     let frames = 0;
     const settleAtBottom = () => {
       if (cancelled) return;
+      // If the user scrolled up to read earlier content (or does so mid-settle),
+      // don't yank them back to the bottom when the stream ends.
+      if (userScrollingUpRef.current) return;
       const el = scrollRef.current;
       if (!el) return;
       const height = el.scrollHeight;
       el.scrollTop = height;
-      userScrollingUpRef.current = false;
       isNearBottomRef.current = true;
       if (height !== lastHeight && frames < 8) {
         lastHeight = height;
