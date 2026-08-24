@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -5651,6 +5651,349 @@ async fn run_claude_command(subcommand: String, cwd: Option<String>) -> Result<S
     }
 }
 
+// --- MCP server ping ---
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct McpPingConfig {
+    #[serde(rename = "type")]
+    transport: String,
+    command: Option<String>,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    url: Option<String>,
+    headers: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpPingResult {
+    ok: bool,
+    latency_ms: u64,
+    server_name: Option<String>,
+    server_version: Option<String>,
+    protocol_version: Option<String>,
+    error: Option<String>,
+}
+
+impl McpPingResult {
+    fn fail(latency_ms: u64, error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            latency_ms,
+            server_name: None,
+            server_version: None,
+            protocol_version: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+fn mcp_initialize_request() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "tokenicode", "version": "0.8.0" }
+        }
+    })
+}
+
+/// Best-effort extract (name, version, protocolVersion) from an MCP
+/// initialize response body — plain JSON or SSE `data:` lines.
+fn extract_mcp_server_info(text: &str) -> (Option<String>, Option<String>, Option<String>) {
+    fn from_value(v: &Value) -> Option<(Option<String>, Option<String>, Option<String>)> {
+        let result = v.get("result")?;
+        let info = result.get("serverInfo")?;
+        Some((
+            info.get("name").and_then(|n| n.as_str()).map(String::from),
+            info.get("version").and_then(|n| n.as_str()).map(String::from),
+            result
+                .get("protocolVersion")
+                .and_then(|n| n.as_str())
+                .map(String::from),
+        ))
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        if let Some(info) = from_value(&v) {
+            return info;
+        }
+    }
+    for line in text.lines() {
+        let payload = match line.trim().strip_prefix("data:") {
+            Some(rest) => rest.trim(),
+            None => continue,
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(info) = from_value(&v) {
+                return info;
+            }
+        }
+    }
+    (None, None, None)
+}
+
+/// Ping an MCP server for liveness: stdio via spawn + JSON-RPC handshake,
+/// http/sse via a POST initialize request.
+#[tauri::command]
+async fn ping_mcp_server(config: McpPingConfig) -> Result<McpPingResult, String> {
+    let transport = if config.transport.is_empty() {
+        "stdio".to_string()
+    } else {
+        config.transport.clone()
+    };
+    if transport == "http" || transport == "sse" {
+        ping_http_mcp(&config).await
+    } else {
+        ping_stdio_mcp(&config).await
+    }
+}
+
+async fn ping_http_mcp(config: &McpPingConfig) -> Result<McpPingResult, String> {
+    let url = config.url.clone().unwrap_or_default();
+    if url.trim().is_empty() {
+        return Ok(McpPingResult::fail(0, "URL is empty"));
+    }
+    let started = std::time::Instant::now();
+    // Local (loopback) MCP servers must never go through the smart proxy —
+    // reqwest does not exempt loopback, and a configured system proxy would
+    // break `claude mcp add --transport http ... 127.0.0.1:port` servers.
+    let trimmed = url.trim();
+    let lower = trimmed.to_lowercase();
+    let is_local = lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("http://0.0.0.0");
+    let client = if is_local {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(8))
+            .no_proxy()
+            .build()
+            .unwrap_or_default()
+    } else {
+        build_smart_http_client(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(8),
+        )
+        .await
+    };
+    let mut req = client.post(trimmed);
+    if let Some(headers) = &config.headers {
+        for (k, v) in headers {
+            if !k.is_empty() {
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+    }
+    let result = req
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .timeout(std::time::Duration::from_secs(8))
+        .json(&mcp_initialize_request())
+        .send()
+        .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                let (name, version, protocol) = extract_mcp_server_info(&body);
+                Ok(McpPingResult {
+                    ok: true,
+                    latency_ms,
+                    server_name: name,
+                    server_version: version,
+                    protocol_version: protocol,
+                    error: None,
+                })
+            } else {
+                let snippet: String = body.chars().take(200).collect();
+                Ok(McpPingResult::fail(
+                    latency_ms,
+                    format!("HTTP {}: {}", status, snippet),
+                ))
+            }
+        }
+        Err(e) => Ok(McpPingResult::fail(latency_ms, e.to_string())),
+    }
+}
+
+async fn ping_stdio_mcp(config: &McpPingConfig) -> Result<McpPingResult, String> {
+    let command = config.command.clone().unwrap_or_default();
+    if command.trim().is_empty() {
+        return Ok(McpPingResult::fail(0, "Command is empty"));
+    }
+    let started = std::time::Instant::now();
+    let enriched_path = build_enriched_path();
+    #[cfg(target_os = "windows")]
+    let mut cmd = if claude_needs_cmd_wrapper(&command) {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(&command).args(&config.args);
+        c
+    } else {
+        let mut c = Command::new(&command);
+        c.args(&config.args);
+        c
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new(&command);
+        c.args(&config.args);
+        c
+    };
+    cmd.env("PATH", &enriched_path);
+    cmd.envs(&config.env);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x08000000);
+        // Disable MSYS2 auto path conversion on Windows (Chinese path fix)
+        cmd.env("MSYS_NO_PATHCONV", "1").env("MSYS2_ARG_CONV_EXCL", "*");
+    }
+    cmd.kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            return Ok(McpPingResult::fail(latency_ms, format!("Failed to spawn: {}", e)));
+        }
+    };
+
+    let handshake = async {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to open stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to open stdout".to_string())?;
+
+        let init = mcp_initialize_request();
+        stdin
+            .write_all(format!("{}\n", init).as_bytes())
+            .await
+            .map_err(|e| format!("Write initialize failed: {}", e))?;
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .map_err(|e| format!("Write initialized failed: {}", e))?;
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")
+            .await
+            .map_err(|e| format!("Write ping failed: {}", e))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Flush stdin failed: {}", e))?;
+        drop(stdin);
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut server_name = None;
+        let mut server_version = None;
+        let mut protocol_version = None;
+        let mut error: Option<String> = None;
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| format!("Read stdout failed: {}", e))?
+        {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                // Log noise on stdout — skip non-JSON lines.
+                continue;
+            };
+            let id = v.get("id").and_then(|i| i.as_i64());
+            if let Some(err) = v.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                if id == Some(1) || id == Some(2) {
+                    error = Some(msg.to_string());
+                    break;
+                }
+            }
+            match id {
+                Some(1) => {
+                    if let Some(result) = v.get("result") {
+                        if let Some(info) = result.get("serverInfo") {
+                            server_name = info
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .map(String::from);
+                            server_version = info
+                                .get("version")
+                                .and_then(|n| n.as_str())
+                                .map(String::from);
+                        }
+                        protocol_version = result
+                            .get("protocolVersion")
+                            .and_then(|n| n.as_str())
+                            .map(String::from);
+                    }
+                }
+                Some(2) => break,
+                _ => {}
+            }
+        }
+        Ok::<_, String>((server_name, server_version, protocol_version, error))
+    };
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), handshake).await;
+
+    // Kill the process (and its tree on Windows — cmd /C leaves grandchildren).
+    let _ = child.kill().await;
+    #[cfg(target_os = "windows")]
+    {
+        let pid = child.id().unwrap_or(0);
+        if pid > 0 {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000)
+                .output()
+                .await;
+        }
+    }
+    let _ = child.wait().await;
+
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Err(_) => Ok(McpPingResult::fail(latency_ms, "Timed out after 15s")),
+        Ok(Err(e)) => Ok(McpPingResult::fail(latency_ms, e)),
+        Ok(Ok((server_name, server_version, protocol_version, error))) => {
+            if let Some(err) = error {
+                Ok(McpPingResult::fail(latency_ms, err))
+            } else if server_name.is_none() && protocol_version.is_none() {
+                // No recognizable MCP initialize response.
+                Ok(McpPingResult::fail(latency_ms, "No MCP response from server"))
+            } else {
+                Ok(McpPingResult {
+                    ok: true,
+                    latency_ms,
+                    server_name,
+                    server_version,
+                    protocol_version,
+                    error: None,
+                })
+            }
+        }
+    }
+}
+
 /// Run a safe `claude plugin ...` command and return stdout/stderr.
 ///
 /// Arguments are passed as process args, not through a shell string, and the
@@ -8329,6 +8672,7 @@ pub fn run() {
             load_providers,
             save_providers,
             test_provider_connection,
+            ping_mcp_server,
             respond_permission,
             send_control_request,
         ])
@@ -8449,5 +8793,130 @@ mod decode_tests {
         println!("Result: {}", result);
         // Should decode to "/Users/tinyzhuang/Desktop/jd 设计"
         assert_eq!(result, "/Users/tinyzhuang/Desktop/jd 设计");
+    }
+}
+
+#[cfg(test)]
+mod mcp_ping_tests {
+    use super::extract_mcp_server_info;
+
+    #[test]
+    fn test_extract_info_from_plain_json() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"zotero-mcp","version":"1.2.3"}}}"#;
+        let (name, version, protocol) = extract_mcp_server_info(body);
+        assert_eq!(name.as_deref(), Some("zotero-mcp"));
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+        assert_eq!(protocol.as_deref(), Some("2024-11-05"));
+    }
+
+    #[test]
+    fn test_extract_info_from_sse() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"test\",\"version\":\"0.1\"}}}\n\n";
+        let (name, version, protocol) = extract_mcp_server_info(body);
+        assert_eq!(name.as_deref(), Some("test"));
+        assert_eq!(version.as_deref(), Some("0.1"));
+        assert_eq!(protocol.as_deref(), Some("2024-11-05"));
+    }
+
+    #[test]
+    fn test_extract_info_no_server_info() {
+        let (name, version, protocol) = extract_mcp_server_info("");
+        assert!(name.is_none() && version.is_none() && protocol.is_none());
+        // A ping response (no serverInfo) yields nothing.
+        let (name, _, _) =
+            extract_mcp_server_info("data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}");
+        assert!(name.is_none());
+    }
+}
+
+#[cfg(test)]
+mod mcp_ping_e2e_tests {
+    use super::{ping_http_mcp, ping_stdio_mcp, McpPingConfig};
+
+    #[tokio::test]
+    async fn test_ping_stdio_handshake() {
+        // A minimal MCP stdio server: answers initialize + ping on stdin lines.
+        let script = r#"
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  try {
+    const msg = JSON.parse(line);
+    if (msg.method === 'initialize') {
+      console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'test-stdio', version: '9.9.9' } } }));
+    } else if (msg.method === 'ping') {
+      console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }));
+    }
+  } catch {}
+});
+"#;
+        let dir = std::env::temp_dir().join(format!("mcp-ping-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("server.js");
+        std::fs::write(&script_path, script).unwrap();
+        let config = McpPingConfig {
+            transport: "stdio".to_string(),
+            command: Some("node".to_string()),
+            args: vec![script_path.to_string_lossy().to_string()],
+            ..Default::default()
+        };
+        let result = ping_stdio_mcp(&config).await.unwrap();
+        assert!(result.ok, "expected ok, got error: {:?}", result.error);
+        assert_eq!(result.server_name.as_deref(), Some("test-stdio"));
+        assert_eq!(result.server_version.as_deref(), Some("9.9.9"));
+        assert_eq!(result.protocol_version.as_deref(), Some("2024-11-05"));
+    }
+
+    #[tokio::test]
+    async fn test_ping_stdio_bad_command() {
+        let config = McpPingConfig {
+            transport: "stdio".to_string(),
+            command: Some("definitely-not-a-real-command-xyz".to_string()),
+            ..Default::default()
+        };
+        let result = ping_stdio_mcp(&config).await.unwrap();
+        assert!(!result.ok, "expected failure for bad command");
+    }
+
+    #[tokio::test]
+    async fn test_ping_http_handshake() {
+        // In-process TCP listener speaking just enough MCP streamable HTTP.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"test-http\",\"version\":\"1.0.0\"}}}\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+        let config = McpPingConfig {
+            transport: "http".to_string(),
+            url: Some(format!("http://{}", addr)),
+            ..Default::default()
+        };
+        let result = ping_http_mcp(&config).await.unwrap();
+        assert!(result.ok, "expected ok, got error: {:?}", result.error);
+        assert_eq!(result.server_name.as_deref(), Some("test-http"));
+        assert_eq!(result.server_version.as_deref(), Some("1.0.0"));
+        assert_eq!(result.protocol_version.as_deref(), Some("2024-11-05"));
+    }
+
+    #[tokio::test]
+    async fn test_ping_http_unreachable() {
+        let config = McpPingConfig {
+            transport: "http".to_string(),
+            // Port 1: nothing listens there — connection refused.
+            url: Some("http://127.0.0.1:1/mcp".to_string()),
+            ..Default::default()
+        };
+        let result = ping_http_mcp(&config).await.unwrap();
+        assert!(!result.ok, "expected failure for unreachable url");
     }
 }

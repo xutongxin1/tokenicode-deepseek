@@ -8,6 +8,13 @@ export interface McpServerConfig {
   args: string[];
   env: Record<string, string>;
   type: string;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
+/** True for URL-based transports (streamable HTTP / legacy SSE). */
+export function isHttpTransport(config: McpServerConfig): boolean {
+  return config.type === 'http' || config.type === 'sse';
 }
 
 export interface McpServer {
@@ -86,15 +93,21 @@ function parseServers(mcpServers: Record<string, unknown> | undefined): McpServe
         args: Array.isArray(cfg.args) ? (cfg.args as string[]) : [],
         env: (cfg.env as Record<string, string>) || {},
         type: (cfg.type as string) || 'stdio',
+        url: (cfg.url as string) || undefined,
+        headers: (cfg.headers as Record<string, string>) || undefined,
       },
     };
   });
 }
 
 function isServerConfig(raw: unknown): boolean {
-  return !!raw
-    && typeof raw === 'object'
-    && typeof (raw as Record<string, unknown>).command === 'string';
+  if (!raw || typeof raw !== 'object') return false;
+  const cfg = raw as Record<string, unknown>;
+  if (typeof cfg.command === 'string') return true;
+  const type = cfg.type as string | undefined;
+  return (type === 'http' || type === 'sse')
+    && typeof cfg.url === 'string'
+    && cfg.url.length > 0;
 }
 
 function getMcpRecord(data: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -204,11 +217,32 @@ function parseCodexMcpServers(toml: string): McpServer[] {
 }
 
 function serverKey(server: McpServer): string {
-  return [
-    server.name,
-    server.config.command,
-    server.config.args.join('\u0001'),
-  ].join('\u0002').toLowerCase();
+  const key = isHttpTransport(server.config)
+    ? [
+      server.name,
+      server.config.url || '',
+      server.config.type,
+    ].join('\u0002')
+    : [
+      server.name,
+      server.config.command,
+      server.config.args.join('\u0001'),
+    ].join('\u0002');
+  return key.toLowerCase();
+}
+
+/** Build the raw ~/.claude.json mcpServers entry for a config. */
+function toRawConfig(config: McpServerConfig): Record<string, unknown> {
+  const raw: Record<string, unknown> = { type: config.type || 'stdio' };
+  if (isHttpTransport(config)) {
+    if (config.url) raw.url = config.url;
+    if (config.headers && Object.keys(config.headers).length > 0) raw.headers = config.headers;
+  } else {
+    raw.command = config.command;
+    raw.args = config.args;
+    if (Object.keys(config.env).length > 0) raw.env = config.env;
+  }
+  return raw;
 }
 
 function mergeDiscovered(
@@ -328,12 +362,7 @@ export const useMcpStore = create<McpState>()((set, get) => ({
     );
 
     for (const server of candidates) {
-      mcpServers[server.name] = {
-        command: server.config.command,
-        args: server.config.args,
-        env: Object.keys(server.config.env).length > 0 ? server.config.env : undefined,
-        type: server.config.type || 'stdio',
-      };
+      mcpServers[server.name] = toRawConfig(server.config);
     }
 
     json.mcpServers = mcpServers;
@@ -353,12 +382,7 @@ export const useMcpStore = create<McpState>()((set, get) => ({
   addServer: async (name, config) => {
     const json = await readClaudeJson();
     const mcpServers = (json.mcpServers as Record<string, unknown>) || {};
-    mcpServers[name] = {
-      command: config.command,
-      args: config.args,
-      env: Object.keys(config.env).length > 0 ? config.env : undefined,
-      type: config.type,
-    };
+    mcpServers[name] = toRawConfig(config);
     json.mcpServers = mcpServers;
     await writeClaudeJson(json);
     const servers = parseServers(mcpServers);
@@ -371,12 +395,7 @@ export const useMcpStore = create<McpState>()((set, get) => ({
     if (oldName !== newName) {
       delete mcpServers[oldName];
     }
-    mcpServers[newName] = {
-      command: config.command,
-      args: config.args,
-      env: Object.keys(config.env).length > 0 ? config.env : undefined,
-      type: config.type,
-    };
+    mcpServers[newName] = toRawConfig(config);
     json.mcpServers = mcpServers;
     await writeClaudeJson(json);
     const servers = parseServers(mcpServers);

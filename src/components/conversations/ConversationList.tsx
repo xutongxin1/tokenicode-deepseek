@@ -719,94 +719,97 @@ export function ConversationList() {
 
   return (
     <div className="flex flex-col gap-1 px-3">
-      {/* Search + Filters */}
-      <div className="px-1 mb-2">
-        <div className="flex items-center gap-2">
-          <div className="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 rounded-xl
-            bg-bg-secondary border border-border-subtle
-            focus-within:border-border-focus transition-smooth">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
-              stroke="currentColor" strokeWidth="1.5"
-              className="text-text-tertiary flex-shrink-0">
-              <circle cx="7" cy="7" r="4.5" />
-              <path d="M10.5 10.5L14 14" />
-            </svg>
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={t('conv.search')}
-              className="flex-1 bg-transparent text-xs text-text-primary
-                placeholder:text-text-tertiary outline-none"
-            />
-            {searchQuery && (
-              <button
-                onClick={() => setSearchQuery('')}
-                className="flex-shrink-0 p-0.5 rounded text-text-tertiary
-                  hover:text-text-primary transition-smooth">
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
-                  stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                  <path d="M4 4l8 8M12 4l-8 8" />
-                </svg>
-              </button>
-            )}
-          </div>
-
-          {/* Archive toggle */}
+      {/* Fixed header: view mode toggle + search (stays on top, no scroll) */}
+      <div className="sticky top-0 z-10 -mx-3 px-3 pb-2 bg-bg-sidebar">
+        {/* View mode toggle */}
+        <div className="flex items-center gap-1 px-1 mb-1">
           <button
-            onClick={() => setShowArchived(!showArchived)}
-            className={`flex-shrink-0 p-2 rounded-lg transition-smooth
-              ${showArchived
-                ? 'bg-accent/10 text-accent'
-                : 'text-text-tertiary hover:bg-bg-secondary hover:text-text-primary'
+            onClick={() => setViewMode('folder')}
+            className={`flex-1 py-1 text-[11px] rounded-lg transition-smooth
+              ${viewMode === 'folder'
+                ? 'bg-accent/10 text-accent font-medium'
+                : 'text-text-tertiary hover:text-text-primary hover:bg-bg-secondary'
               }`}
-            title={t('conv.showArchived')}
           >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
-              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="1" y="2" width="14" height="3" rx="1" />
-              <path d="M2 5v7a1 1 0 001 1h10a1 1 0 001-1V5" />
-              <path d="M6 8h4" />
-            </svg>
+            <span className="flex items-center justify-center gap-1">
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
+                stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <path d="M2 4h4l2 2h6v7H2V4z" />
+              </svg>
+              {t('conv.viewFolder')}
+            </span>
+          </button>
+          <button
+            onClick={() => setViewMode('recent')}
+            className={`flex-1 py-1 text-[11px] rounded-lg transition-smooth
+              ${viewMode === 'recent'
+                ? 'bg-accent/10 text-accent font-medium'
+                : 'text-text-tertiary hover:text-text-primary hover:bg-bg-secondary'
+              }`}
+          >
+            <span className="flex items-center justify-center gap-1">
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
+                stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <circle cx="8" cy="8" r="6" />
+                <path d="M8 4v4l3 2" />
+              </svg>
+              {t('conv.viewRecent')}
+            </span>
           </button>
         </div>
-      </div>
 
-      {/* View mode toggle */}
-      <div className="flex items-center gap-1 px-1 mb-1">
-        <button
-          onClick={() => setViewMode('folder')}
-          className={`flex-1 py-1 text-[11px] rounded-lg transition-smooth
-            ${viewMode === 'folder'
-              ? 'bg-accent/10 text-accent font-medium'
-              : 'text-text-tertiary hover:text-text-primary hover:bg-bg-secondary'
-            }`}
-        >
-          <span className="flex items-center justify-center gap-1">
-            <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
-              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <path d="M2 4h4l2 2h6v7H2V4z" />
-            </svg>
-            {t('conv.viewFolder')}
-          </span>
-        </button>
-        <button
-          onClick={() => setViewMode('recent')}
-          className={`flex-1 py-1 text-[11px] rounded-lg transition-smooth
-            ${viewMode === 'recent'
-              ? 'bg-accent/10 text-accent font-medium'
-              : 'text-text-tertiary hover:text-text-primary hover:bg-bg-secondary'
-            }`}
-        >
-          <span className="flex items-center justify-center gap-1">
-            <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
-              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <circle cx="8" cy="8" r="6" />
-              <path d="M8 4v4l3 2" />
-            </svg>
-            {t('conv.viewRecent')}
-          </span>
-        </button>
+        {/* Search + Filters */}
+        <div className="px-1">
+          <div className="flex items-center gap-2">
+            <div className="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 rounded-xl
+              bg-bg-secondary border border-border-subtle
+              focus-within:border-border-focus transition-smooth">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+                stroke="currentColor" strokeWidth="1.5"
+                className="text-text-tertiary flex-shrink-0">
+                <circle cx="7" cy="7" r="4.5" />
+                <path d="M10.5 10.5L14 14" />
+              </svg>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={t('conv.search')}
+                className="flex-1 bg-transparent text-xs text-text-primary
+                  placeholder:text-text-tertiary outline-none"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="flex-shrink-0 p-0.5 rounded text-text-tertiary
+                    hover:text-text-primary transition-smooth">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+                    stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                    <path d="M4 4l8 8M12 4l-8 8" />
+                  </svg>
+                </button>
+              )}
+            </div>
+
+            {/* Archive toggle */}
+            <button
+              onClick={() => setShowArchived(!showArchived)}
+              className={`flex-shrink-0 p-2 rounded-lg transition-smooth
+                ${showArchived
+                  ? 'bg-accent/10 text-accent'
+                  : 'text-text-tertiary hover:bg-bg-secondary hover:text-text-primary'
+                }`}
+              title={t('conv.showArchived')}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+                stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="1" y="2" width="14" height="3" rx="1" />
+                <path d="M2 5v7a1 1 0 001 1h10a1 1 0 001-1V5" />
+                <path d="M6 8h4" />
+              </svg>
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Loading */}
