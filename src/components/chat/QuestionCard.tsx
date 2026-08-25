@@ -30,11 +30,23 @@ interface Props {
 export function QuestionCard({ message, floating }: Props) {
   const t = useT();
   const questions = message.questions || [];
-  const [currentIdx, setCurrentIdx] = useState(0);
-  const [selectedMap, setSelectedMap] = useState<Record<number, Set<number>>>({});
-  const [otherText, setOtherText] = useState<Record<number, string>>({});
-  const [useOther, setUseOther] = useState<Record<number, boolean>>({});
-  const [answeredMap, setAnsweredMap] = useState<Record<number, string>>({});
+  // Restore the in-progress interaction from the message draft (persisted in
+  // chatStore so switching sessions doesn't lose selections / "other" text).
+  const draft = message.questionDraft;
+  const [currentIdx, setCurrentIdx] = useState(() =>
+    Math.max(0, Math.min(draft?.currentIdx ?? 0, Math.max(0, questions.length - 1)))
+  );
+  const [selectedMap, setSelectedMap] = useState<Record<number, Set<number>>>(() =>
+    Object.fromEntries(
+      Object.entries(draft?.selectedMap ?? {}).map(([k, v]) => [Number(k), new Set<number>(v)]),
+    )
+  );
+  const [otherText, setOtherText] = useState<Record<number, string>>(draft?.otherText ?? {});
+  const [useOther, setUseOther] = useState<Record<number, boolean>>(draft?.useOther ?? {});
+  const [answeredMap, setAnsweredMap] = useState<Record<number, string>>(draft?.answeredMap ?? {});
+  const [supplementText, setSupplementText] = useState<Record<number, string>>(draft?.supplementText ?? {});
+  // Whether the "other" textarea is focused (expanded to multi-line)
+  const [otherFocused, setOtherFocused] = useState(false);
   // Collapsed by default once resolved — expand to review the full Q&A.
   const [expanded, setExpanded] = useState(false);
   // Which question's option list is expanded inside the Q&A record
@@ -49,6 +61,25 @@ export function QuestionCard({ message, floating }: Props) {
     setExpanded(false);
     setExpandedIdx(null);
   }, [message.id]);
+
+  // Write-through: persist the interaction draft on the message (in the active
+  // tab) on every change, so the floating card's unmount/remount across
+  // session switches restores the exact in-progress state.
+  useEffect(() => {
+    if (isFullyResolved) return;
+    const tabId = useSessionStore.getState().selectedSessionId;
+    if (!tabId) return;
+    useChatStore.getState().setQuestionDraft(tabId, message.id, {
+      currentIdx,
+      selectedMap: Object.fromEntries(
+        Object.entries(selectedMap).map(([k, v]) => [Number(k), Array.from(v)]),
+      ),
+      otherText,
+      useOther,
+      answeredMap,
+      supplementText,
+    });
+  }, [currentIdx, selectedMap, otherText, useOther, answeredMap, supplementText, isFullyResolved, message.id]);
 
   // Question → answer pairs for the resolved/collapsed record. Prefer the
   // persisted answers (survive tab switches + history reload); fall back to
@@ -99,11 +130,13 @@ export function QuestionCard({ message, floating }: Props) {
       return otherText[qIdx].trim();
     }
     const selected = selectedMap[qIdx] || new Set<number>();
-    return Array.from(selected)
+    const labels = Array.from(selected)
       .map((i) => q.options[i]?.label)
       .filter(Boolean)
       .join(', ');
-  }, [currentIdx, questions, selectedMap, useOther, otherText]);
+    const supplement = supplementText[qIdx]?.trim();
+    return supplement ? `${labels}（${supplement}）` : labels;
+  }, [currentIdx, questions, selectedMap, useOther, otherText, supplementText]);
 
   const hasCurrentSelection = useOther[currentIdx]
     ? !!otherText[currentIdx]?.trim()
@@ -114,10 +147,32 @@ export function QuestionCard({ message, floating }: Props) {
   const isFailed = interactionState === 'failed';
   const awaitingSdkPatch = !isFullyResolved && !message.permissionData?.requestId;
 
+  const handleBack = useCallback(() => {
+    if (isFullyResolved || isSending) return;
+    const prevIdx = currentIdx - 1;
+    setCurrentIdx(prevIdx);
+    // Remove the answer of the question we're returning to so the timeline
+    // doesn't show it as already answered while it's being re-edited.
+    setAnsweredMap((prev) => {
+      const next = { ...prev };
+      delete next[prevIdx];
+      return next;
+    });
+  }, [isFullyResolved, isSending, currentIdx]);
+
   const handleConfirm = useCallback(async () => {
     if (isFullyResolved || isSending || awaitingSdkPatch) return;
     const answerText = getCurrentAnswer();
-    setAnsweredMap((prev) => ({ ...prev, [currentIdx]: answerText }));
+    setAnsweredMap((prev) => {
+      const next = { ...prev };
+      // Drop stale answers for questions after the current one (after going
+      // back and re-answering, the old later answers no longer apply)
+      Object.keys(next).forEach((k) => {
+        if (Number(k) > currentIdx) delete next[Number(k)];
+      });
+      next[currentIdx] = answerText;
+      return next;
+    });
 
     const isLast = currentIdx >= questions.length - 1;
     if (isLast) {
@@ -126,7 +181,7 @@ export function QuestionCard({ message, floating }: Props) {
       const { setInteractionState, setQuestionAnswers, setSessionStatus, setActivityStatus } = useChatStore.getState();
       const stdinId = getActiveTabState().sessionMeta.stdinId;
       if (!stdinId) return;
-      const answers = buildAskUserQuestionAnswers(questions, selectedMap, otherText, useOther);
+      const answers = buildAskUserQuestionAnswers(questions, selectedMap, otherText, useOther, supplementText);
       // Persist the Q&A record on the message so the resolved card (and
       // reloaded history) can show a collapsible "question → answer" view.
       setQuestionAnswers(qTabId, message.id, answers);
@@ -145,7 +200,7 @@ export function QuestionCard({ message, floating }: Props) {
     } else {
       setCurrentIdx(currentIdx + 1);
     }
-  }, [isFullyResolved, isSending, awaitingSdkPatch, currentIdx, questions, selectedMap, useOther, otherText, message.id, message.permissionData, message.toolInput, getCurrentAnswer]);
+  }, [isFullyResolved, isSending, awaitingSdkPatch, currentIdx, questions, selectedMap, useOther, otherText, supplementText, message.id, message.permissionData, message.toolInput, getCurrentAnswer]);
 
   const handleSkip = useCallback(async () => {
     if (isFullyResolved || isSending || awaitingSdkPatch) return;
@@ -414,19 +469,38 @@ export function QuestionCard({ message, floating }: Props) {
               </button>
             </div>
 
-            {/* Other text input */}
+            {/* Supplement — optional extra context attached to the selected option(s) */}
+            {(selectedMap[currentIdx]?.size ?? 0) > 0 && !useOther[currentIdx] && (
+              <div className="mb-3">
+                <textarea
+                  value={supplementText[currentIdx] || ''}
+                  onChange={(e) => setSupplementText((p) => ({ ...p, [currentIdx]: e.target.value }))}
+                  placeholder={t('msg.questionSupplementPlaceholder')}
+                  rows={2}
+                  className="w-full resize-none px-3 py-1.5 rounded-lg text-xs
+                    bg-transparent border border-dashed border-border-subtle
+                    focus:border-border-focus outline-none text-text-primary
+                    placeholder:text-text-tertiary transition-smooth"
+                />
+              </div>
+            )}
+
+            {/* Other text input — expands to multi-line while focused */}
             {useOther[currentIdx] && (
               <div className="mb-3">
-                <input
-                  type="text"
+                <textarea
                   value={otherText[currentIdx] || ''}
                   onChange={(e) => setOtherText((p) => ({ ...p, [currentIdx]: e.target.value }))}
                   placeholder={t('msg.questionOtherPlaceholder')}
                   autoFocus
-                  className="w-full max-w-xs px-3 py-1.5 rounded-lg text-xs
+                  rows={otherFocused ? 4 : 1}
+                  onFocus={() => setOtherFocused(true)}
+                  onBlur={() => setOtherFocused(false)}
+                  className={`w-full resize-none px-3 py-1.5 rounded-lg text-xs
                     bg-transparent border border-border-subtle
                     focus:border-border-focus outline-none text-text-primary
-                    placeholder:text-text-tertiary transition-smooth"
+                    placeholder:text-text-tertiary transition-smooth
+                    ${otherFocused ? '' : 'max-w-xs'}`}
                   onKeyDown={(e) => {
                     if (e.nativeEvent.isComposing) return;
                     if (e.key === 'Enter' && !e.shiftKey) {
@@ -448,6 +522,23 @@ export function QuestionCard({ message, floating }: Props) {
 
             {/* Action buttons */}
             <div className="flex items-center gap-2">
+              {currentIdx > 0 && (
+                <button
+                  onClick={handleBack}
+                  disabled={isSending}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium
+                    text-text-tertiary hover:text-text-primary
+                    hover:bg-bg-tertiary transition-smooth cursor-pointer
+                    disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
+                    stroke="currentColor" strokeWidth="1.5"
+                    strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M7.5 2.5L4 6l3.5 3.5" />
+                  </svg>
+                  {t('msg.questionBack')}
+                </button>
+              )}
               <button
                 onClick={handleConfirm}
                 disabled={!hasCurrentSelection || isSending || awaitingSdkPatch}

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { bridge, SessionListItem, ContentSearchResult } from '../lib/tauri-bridge';
+import { useChatStore } from './chatStore';
 
 // Persist custom session names in localStorage as fast cache,
 // and sync to disk via Tauri backend for durability.
@@ -132,10 +133,34 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   setSearchQuery: (query) => set({ searchQuery: query }),
 
   setSelectedSession: (id) => {
+    const state = get();
+    const prevId = state.selectedSessionId;
+    // Auto-delete the session being left if it's an untouched draft: never
+    // written to disk, no messages, and nothing typed in the input box.
+    if (prevId && prevId !== id) {
+      const prev = state.sessions.find((s) => s.id === prevId);
+      if (prev && prev.path === '') {
+        const tab = useChatStore.getState().getTab(prevId);
+        const isEmpty = !tab || (tab.messages.length === 0 && !tab.inputDraft?.trim());
+        if (isEmpty) {
+          if (tab?.sessionMeta?.stdinId) {
+            // Kill the pre-warmed CLI process so it doesn't linger
+            bridge.killSession(tab.sessionMeta.stdinId).catch(() => {});
+            get().unregisterStdinTab(tab.sessionMeta.stdinId);
+          }
+          useChatStore.getState().removeTab(prevId);
+          set({
+            sessions: state.sessions.filter((s) => s.id !== prevId),
+            // Draft is gone — if back-navigation pointed at it, clear it
+            previousSessionId: state.previousSessionId === prevId ? undefined : state.previousSessionId,
+          });
+        }
+      }
+    }
     saveLastSessionId(id);
-    set((state) => ({
+    set((s) => ({
       selectedSessionId: id,
-      previousSessionId: state.selectedSessionId !== id ? state.selectedSessionId : state.previousSessionId,
+      previousSessionId: s.selectedSessionId !== id ? s.selectedSessionId : s.previousSessionId,
     }));
   },
 

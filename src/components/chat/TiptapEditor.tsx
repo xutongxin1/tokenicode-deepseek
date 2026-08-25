@@ -156,7 +156,36 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
           return onKeyDownRef.current?.(event) === true;
         },
         handlePaste: (_view, event) => {
-          return onPasteRef.current?.(event as unknown as ClipboardEvent) === true;
+          // File-path pastes (file chips) are handled by InputBar's onPaste
+          if (onPasteRef.current?.(event as unknown as ClipboardEvent) === true) return true;
+          // Strip rich-text formatting: insert plain text instead of TipTap's
+          // default HTML paste, which would carry bold/italic marks into the
+          // editor (and later get dropped silently at send time anyway).
+          const cd = (event as ClipboardEvent).clipboardData;
+          if (!cd || !editor) return false;
+          let text = cd.getData('text/plain');
+          if (!text) {
+            const html = cd.getData('text/html');
+            if (html) {
+              // HTML-only clipboard: rebuild line breaks, then extract text
+              const doc = new DOMParser().parseFromString(html, 'text/html');
+              doc.querySelectorAll('br').forEach((br) => br.replaceWith('\n'));
+              doc.querySelectorAll('p, div, li').forEach((el) => el.append('\n'));
+              text = doc.body.textContent ?? '';
+            }
+          }
+          if (!text) return false; // non-text clipboard (e.g. image) → default handling
+          text = text.replace(/\r\n?/g, '\n').replace(/\n+$/, '');
+          // Lines joined by hardBreaks (same convention as Shift+Enter and
+          // the editorToPlainText serializer)
+          const content = text.split('\n').flatMap((line, i) => {
+            const nodes: { type: string; text?: string }[] = [];
+            if (i > 0) nodes.push({ type: 'hardBreak' });
+            if (line) nodes.push({ type: 'text', text: line });
+            return nodes;
+          });
+          editor.chain().insertContent(content).run();
+          return true;
         },
       },
       onUpdate: ({ editor: ed }) => {
