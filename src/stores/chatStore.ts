@@ -39,6 +39,18 @@ export interface PermissionRequestData {
   toolUseId?: string;
 }
 
+/** In-progress AskUserQuestion interaction draft — persists on the message so
+ *  switching sessions (floating card unmount/remount) doesn't lose the user's
+ *  selections, "other" text, current question index, or supplement text. */
+export interface QuestionDraft {
+  currentIdx: number;
+  selectedMap: Record<number, number[]>; // Sets serialized as arrays
+  otherText: Record<number, string>;
+  useOther: Record<number, boolean>;
+  answeredMap: Record<number, string>;
+  supplementText: Record<number, string>;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -65,6 +77,8 @@ export interface ChatMessage {
   /** User's answers keyed by question text — persisted so answered
    *  questions render a collapsible Q&A record even after history reload. */
   questionAnswers?: Record<string, string>;
+  /** Draft of an unfinished question interaction (survives tab switches). */
+  questionDraft?: QuestionDraft;
   // TodoWrite fields
   todoItems?: TodoItem[];          // todo list items
   // File attachments (user-sent images/files)
@@ -219,6 +233,8 @@ interface ChatState {
   setInteractionState: (tabId: string, msgId: string, state: InteractionState, error?: string) => void;
   /** Persist the user's answers to an AskUserQuestion card (keyed by question text). */
   setQuestionAnswers: (tabId: string, msgId: string, answers: Record<string, string>) => void;
+  /** Persist the in-progress draft of an unfinished question interaction. */
+  setQuestionDraft: (tabId: string, msgId: string, draft: QuestionDraft | undefined) => void;
   getActiveInteraction: (tabId: string) => ChatMessage | undefined;
 
   // --- Tab lifecycle ---
@@ -546,6 +562,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
             interactionState,
             interactionError: error,
             resolved: interactionState === 'resolved',
+            // Once resolved the interaction is over — drop the draft
+            questionDraft: interactionState === 'resolved' ? undefined : m.questionDraft,
           } : m,
         ),
       }));
@@ -558,6 +576,17 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         ...tab,
         messages: tab.messages.map((m) =>
           m.id === msgId ? { ...m, questionAnswers: answers } : m,
+        ),
+      }));
+      return result ?? {};
+    }),
+
+  setQuestionDraft: (tabId, msgId, draft) =>
+    set((state) => {
+      const result = updateTab(state.tabs, tabId, (tab) => ({
+        ...tab,
+        messages: tab.messages.map((m) =>
+          m.id === msgId ? { ...m, questionDraft: draft } : m,
         ),
       }));
       return result ?? {};
