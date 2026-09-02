@@ -14,6 +14,7 @@ import {
   useRef,
 } from 'react';
 import { EditorContent, ReactNodeViewRenderer, useEditor } from '@tiptap/react';
+import type { EditorView } from '@tiptap/pm/view';
 import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
 import { FileChipExtension, type FileChipAttrs } from './file-chip-extension';
@@ -32,8 +33,10 @@ export interface TiptapEditorHandle {
   focus(): void;
   /** Insert a file chip at the current cursor position */
   insertFileChip(attrs: FileChipAttrs): void;
-  /** Insert plain text at the current cursor position */
-  insertTextAtCursor(text: string): void;
+  /** Insert plain text at the current cursor position. An explicit selection
+   *  (e.g. captured from ProseMirror at paste time) is authoritative and
+   *  overrides the blur-restore heuristic. */
+  insertTextAtCursor(text: string, sel?: { from: number; to: number }): void;
   /** Whether the editor has no content */
   isEmpty(): boolean;
   /** Whether an IME composition is in progress */
@@ -53,8 +56,9 @@ interface TiptapEditorProps {
   onUpdate?: (text: string) => void;
   /** Called on keydown — receives the native keyboard event */
   onKeyDown?: (e: KeyboardEvent) => boolean | void;
-  /** Called on paste */
-  onPaste?: (e: ClipboardEvent) => boolean | void;
+  /** Called on paste — receives the ProseMirror view so the handler can
+   *  insert at the paste-time selection (authoritative caret position). */
+  onPaste?: (e: ClipboardEvent, view: EditorView) => boolean | void;
   /** Additional CSS class for the wrapper */
   className?: string;
   /** data attribute for external querySelector targeting */
@@ -83,7 +87,9 @@ function editorToPlainText(editor: ReturnType<typeof useEditor>): string {
     const lineParts: string[] = [];
     for (const node of (block.content ?? []) as any[]) {
       if (node.type === 'fileChip') {
-        const displayPath = node.attrs?.label ?? node.attrs?.fullPath ?? '';
+        // Serialize the ABSOLUTE path — what the CLI actually needs.
+        // (label is a display hint and may be relative.)
+        const displayPath = node.attrs?.fullPath ?? node.attrs?.label ?? '';
         lineParts.push(`\`${displayPath}\``);
       } else if (node.type === 'text') {
         lineParts.push(node.text ?? '');
@@ -155,9 +161,9 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
           }
           return onKeyDownRef.current?.(event) === true;
         },
-        handlePaste: (_view, event) => {
+        handlePaste: (view, event) => {
           // File-path pastes (file chips) are handled by InputBar's onPaste
-          if (onPasteRef.current?.(event as unknown as ClipboardEvent) === true) return true;
+          if (onPasteRef.current?.(event as unknown as ClipboardEvent, view) === true) return true;
           // Strip rich-text formatting: insert plain text instead of TipTap's
           // default HTML paste, which would carry bold/italic marks into the
           // editor (and later get dropped silently at send time anyway).
@@ -258,28 +264,50 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
       },
       insertFileChip(attrs: FileChipAttrs) {
         if (!editor) return;
-        editor.commands.focus();
-        editor
-          .chain()
-          .insertContent({
+        // If the editor was blurred (e.g. clicking in the file tree), restore
+        // the last editing position; when focused, the live selection is
+        // already correct and must NOT be overridden by a stale saved one.
+        const saved = savedSelectionRef.current;
+        const useSaved = !editor.isFocused && saved
+          && saved.from <= editor.state.doc.content.size
+          && saved.to <= editor.state.doc.content.size;
+        if (useSaved) {
+          editor.chain().focus().setTextSelection(saved).insertContent({
             type: 'fileChip',
             attrs,
-          })
-          .insertContent(' ')  // space after chip for typing
-          .run();
+          }).insertContent(' ').run();
+        } else {
+          editor.chain().focus().insertContent({
+            type: 'fileChip',
+            attrs,
+          }).insertContent(' ').run();
+        }
       },
-      insertTextAtCursor(text: string) {
+      insertTextAtCursor(text: string, sel?: { from: number; to: number }) {
         if (!editor) return;
-        editor.commands.focus();
+        // Explicit selection (captured from the ProseMirror view at paste
+        // time) is the authoritative insertion point — it is exactly where
+        // the browser would have inserted the paste, regardless of focus
+        // state or stale saved positions.
+        if (sel
+          && sel.from <= editor.state.doc.content.size
+          && sel.to <= editor.state.doc.content.size) {
+          editor.chain().focus().setTextSelection(sel).insertContent(text).run();
+          return;
+        }
         // Restore the cursor position from before the editor lost focus —
         // clicking in the file tree blurs the editor, after which a plain
         // insertContent would land at the end of the document instead of
-        // where the user was last editing.
+        // where the user was last editing. When the editor IS focused
+        // (typing, pasting), the live selection is authoritative.
         const saved = savedSelectionRef.current;
-        if (saved && saved.from <= editor.state.doc.content.size && saved.to <= editor.state.doc.content.size) {
+        const useSaved = !editor.isFocused && saved
+          && saved.from <= editor.state.doc.content.size
+          && saved.to <= editor.state.doc.content.size;
+        if (useSaved) {
           editor.chain().focus().setTextSelection(saved).insertContent(text).run();
         } else {
-          editor.chain().insertContent(text).run();
+          editor.chain().focus().insertContent(text).run();
         }
       },
       isEmpty() {

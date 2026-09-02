@@ -11,6 +11,21 @@ import { useFileStore } from '../../stores/fileStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { rehypeKatexFix } from '../../lib/rehype-katex-fix';
 import { useT } from '../../lib/i18n';
+import {
+  wrapBareFilePaths,
+  resolvePathCandidate,
+  getCachedResolution,
+  resolveFolderCandidate,
+  getCachedFolderResolution,
+  isAbsolutePath,
+  FILE_PATH_RE,
+  FOLDER_PATH_RE,
+  KNOWN_EXT_RE,
+  KNOWN_FILE_EXTENSIONS,
+  DIR_CANDIDATE_RE,
+  looksLikeDirectory,
+} from '../../lib/path-links';
+import { FileIcon } from './FileIcon';
 import 'katex/dist/katex.min.css';
 
 /* ================================================================
@@ -173,58 +188,153 @@ function extractText(node: ReactNode): string {
   return '';
 }
 
-/** Known code/config file extensions — shared between wrapBareFilePaths and inline code detection. */
-const KNOWN_FILE_EXTENSIONS = new Set([
-  'md', 'mdx', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'json', 'jsonl',
-  'toml', 'yaml', 'yml', 'py', 'pyi', 'rs', 'go', 'html', 'htm', 'css',
-  'scss', 'sass', 'less', 'vue', 'svelte', 'sh', 'bash', 'zsh', 'fish',
-  'env', 'conf', 'cfg', 'ini', 'xml', 'sql', 'graphql', 'gql', 'proto',
-  'lock', 'log', 'txt', 'csv', 'rb', 'php', 'java', 'kt', 'swift', 'c',
-  'cpp', 'h', 'hpp', 'cs', 'r', 'lua', 'zig', 'ex', 'exs', 'erl', 'ml',
-  'mli', 'tf', 'hcl', 'dockerfile', 'makefile', 'png', 'jpg', 'jpeg',
-  'gif', 'svg', 'webp', 'ico', 'wasm', 'map',
-]);
+/* File-path regexes and bare-path wrapping live in src/lib/path-links.ts
+   (shared with MessageBubble and unit-tested). */
 
-/** Detect file paths in inline code — conservative regex to avoid false positives.
- *  Matches: path-prefixed files (/foo.ts, ./bar.md, src/baz.rs) AND
- *  bare filenames with known code/config extensions (CLAUDE.md, package.json). */
-const KNOWN_EXT_RE = /^[\w][\w.-]*\.(?:md|mdx|ts|tsx|js|jsx|mjs|cjs|json|jsonl|toml|yaml|yml|py|pyi|rs|go|html|htm|css|scss|sass|less|vue|svelte|sh|bash|zsh|fish|env|conf|cfg|ini|xml|sql|graphql|gql|proto|lock|log|txt|csv|rb|php|java|kt|swift|c|cpp|h|hpp|cs|r|lua|zig|ex|exs|erl|ml|mli|tf|hcl|dockerfile|makefile)$/i;
-const FILE_PATH_RE = /^(?:\/|\.\/|\.\.\/|[a-zA-Z]:[/\\]|src\/|lib\/|components\/|stores\/|hooks\/|utils\/|tests\/|__tests__\/)[\w.@/-]+\.\w{1,10}$/;
+/* ================================================================
+   PathChip / ResolvablePathChip — clickable file paths in assistant text
+   ================================================================ */
 
-/**
- * Pre-process markdown to wrap bare file paths in backticks so the existing
- * `code` component handler can make them clickable.
- *
- * Only processes text outside fenced code blocks and inline code.
- * Matches absolute paths (/..., C:\...), relative (./..., ../...), and
- * common project-relative paths (src/..., lib/..., etc.).
- */
-const BARE_PATH_RE = /(^|[^`\w:@#/])((?:(?:\/|\.\.?\/)[\w.@/+-]+\.\w{1,10}|(?:src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config)\/[\w.@/+-]+\.\w{1,10}))(?![`\w])/g;
+/** Clickable file-path chip — relative candidates display as-is; absolute
+ *  ones show the full path (truncated only when extremely long; hover
+ *  title always shows the resolved absolute path). Icon varies by file
+ *  type (same FileIcon as the file tree).
+ *  Click = preview in right panel; Ctrl/Cmd+click = open with the system
+ *  default app (same as the file tree). */
+function PathChip({ resolved, display }: { resolved: string; display?: string }) {
+  return (
+    <button
+      onClick={(e) => {
+        if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+          bridge.openWithDefaultApp(resolved);
+        } else {
+          useFileStore.getState().selectFile(resolved);
+        }
+      }}
+      onContextMenu={(e) => {
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault();
+          bridge.revealInFinder(resolved);
+        }
+      }}
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
+        bg-accent/10 border border-accent/25 rounded-md
+        text-xs text-accent font-medium cursor-pointer
+        hover:bg-accent/20 hover:border-accent/40
+        transition-all duration-150 select-none
+        align-baseline leading-normal whitespace-nowrap"
+      title={resolved}
+    >
+      <FileIcon name={resolved} size={12} className="flex-shrink-0" />
+      <span className="max-w-[240px] truncate">{display ?? resolved}</span>
+    </button>
+  );
+}
 
-function wrapBareFilePaths(content: string): string {
-  // Split by fenced code blocks (``` ... ```) — don't touch code blocks
-  const fenced = content.split(/(```[\s\S]*?```)/g);
-  return fenced.map((part, i) => {
-    if (i % 2 === 1) return part; // inside fenced code block
-    // Split by inline code (` ... `) — don't double-wrap
-    const inlined = part.split(/(`[^`\n]+`)/g);
-    return inlined.map((seg, j) => {
-      if (j % 2 === 1) return seg; // inside inline code
-      // Also skip markdown link targets: [text](url)
-      return seg.replace(BARE_PATH_RE, (match, prefix, path, offset, str) => {
-        const pathStart = offset + prefix.length;
-        // Don't wrap if inside a markdown link target: ...](path)
-        if (pathStart > 0 && str[pathStart - 1] === '(') return match;
-        // Don't wrap if preceded by ]( (markdown link)
-        const before = str.slice(Math.max(0, pathStart - 2), pathStart);
-        if (before.endsWith('](')) return match;
-        // TK-323: Only wrap if extension is a known code/config file type
-        const ext = path.split('.').pop()?.toLowerCase();
-        if (!ext || !KNOWN_FILE_EXTENSIONS.has(ext)) return match;
-        return `${prefix}\`${path}\``;
-      });
-    }).join('');
-  }).join('');
+/** Path (absolute or relative) — verified against disk in the background.
+ *  Renders as plain code until resolution settles; becomes a PathChip only
+ *  if the path actually exists. Resolution is cached per (cwd, candidate),
+ *  so each message processes each path at most once. */
+function ResolvablePathChip({ candidate, base }: {
+  candidate: string;
+  base: string;
+}) {
+  const [state, setState] = useState<'pending' | 'missing' | { abs: string }>(() => {
+    const hit = getCachedResolution(base, candidate);
+    if (hit === undefined) return 'pending';
+    return hit ? { abs: hit } : 'missing';
+  });
+
+  useEffect(() => {
+    if (state !== 'pending') return;
+    let cancelled = false;
+    resolvePathCandidate(base, candidate).then((abs) => {
+      if (!cancelled) setState(abs ? { abs } : 'missing');
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [base, candidate]);
+
+  if (state !== 'pending' && state !== 'missing') {
+    return (
+      <PathChip
+        resolved={state.abs}
+        display={isAbsolutePath(candidate) ? state.abs : candidate}
+      />
+    );
+  }
+  // Pending or unresolvable — render as plain inline code
+  return <code>{candidate}</code>;
+}
+
+/** Clickable folder chip — relative candidates display as-is (kept short);
+ *  absolute ones show the full path. Hover title always shows the resolved
+ *  absolute path.
+ *  Click = reveal in file manager; Ctrl/Cmd+click = open with the system
+ *  default app. */
+function FolderChip({ resolved, display }: { resolved: string; display?: string }) {
+  return (
+    <button
+      onClick={(e) => {
+        if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+          bridge.openWithDefaultApp(resolved);
+        } else {
+          bridge.revealInFinder(resolved);
+        }
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        bridge.revealInFinder(resolved);
+      }}
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
+        bg-accent/10 border border-accent/25 rounded-md
+        text-xs text-accent font-medium cursor-pointer
+        hover:bg-accent/20 hover:border-accent/40
+        transition-all duration-150 select-none
+        align-baseline leading-normal whitespace-nowrap"
+      title={resolved}
+    >
+      <FileIcon name={resolved} isDir size={12} className="flex-shrink-0" />
+      <span className="max-w-[240px] truncate">{display ?? `${resolved}/`}</span>
+    </button>
+  );
+}
+
+/** Folder path (absolute or relative) — verified in the background via
+ *  checkFileAccess (read_dir succeeds only for directories). Becomes a
+ *  FolderChip only if the directory exists on disk. */
+function ResolvableFolderChip({ candidate, base }: {
+  candidate: string;
+  base: string;
+}) {
+  const [state, setState] = useState<'pending' | 'missing' | { abs: string }>(() => {
+    const hit = getCachedFolderResolution(base, candidate);
+    if (hit === undefined) return 'pending';
+    return hit ? { abs: hit } : 'missing';
+  });
+
+  useEffect(() => {
+    if (state !== 'pending') return;
+    let cancelled = false;
+    resolveFolderCandidate(base, candidate).then((abs) => {
+      if (!cancelled) setState(abs ? { abs } : 'missing');
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [base, candidate]);
+
+  if (state !== 'pending' && state !== 'missing') {
+    return (
+      <FolderChip
+        resolved={state.abs}
+        // Relative candidates stay short (trailing slash restored — the
+        // code handler strips it before resolution); absolute ones show
+        // the full resolved path.
+        display={isAbsolutePath(candidate) ? `${state.abs}/` : `${candidate}/`}
+      />
+    );
+  }
+  return <code>{candidate}</code>;
 }
 
 /* ================================================================
@@ -352,6 +462,7 @@ class MarkdownErrorBoundary extends React.Component<
 export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, basePath }: Props) {
   const t = useT();
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
+  const pathLinksEnabled = useSettingsStore((s) => s.pathLinksEnabled);
   const resolveBase = basePath || workingDirectory || '';
   const [remarkPlugins, setRemarkPlugins] = useState<RemarkPlugin[]>(() => cachedRemarkPlugins ?? EMPTY_REMARK_PLUGINS);
 
@@ -369,7 +480,10 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
   }, []);
 
   // Pre-process: wrap bare file paths in backticks so `code` handler makes them clickable
-  const processedContent = useMemo(() => wrapBareFilePaths(content), [content]);
+  const processedContent = useMemo(
+    () => (pathLinksEnabled ? wrapBareFilePaths(content) : content),
+    [content, pathLinksEnabled],
+  );
 
   // Stable components object — only recreated if `t` or resolveBase changes
   const components = useMemo(() => ({
@@ -502,45 +616,42 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
     code: ({ children, className }: { children?: ReactNode; className?: string }) => {
       // Fenced code blocks (language-xxx) — don't intercept, let <pre> handle them
       if (className) return <code className={className}>{children}</code>;
+      // Path chips disabled — render plain inline code, no clickable paths
+      if (!pathLinksEnabled) {
+        return <code>{children}</code>;
+      }
 
       const text = extractText(children).trim();
+      // Every chip — absolute or relative — goes through background
+      // existence verification, so truncated paths like
+      // `.../55433fdd-....jsonl` never become clickable.
+      if (FOLDER_PATH_RE.test(text)) {
+        // Folder paths (trailing separator) — folder chip (FileIcon)
+        return (
+          <ResolvableFolderChip
+            candidate={text.replace(/[\\/]+$/, '')}
+            base={resolveBase}
+          />
+        );
+      }
       const ext = text.split('.').pop()?.toLowerCase() ?? '';
       if (((FILE_PATH_RE.test(text) || KNOWN_EXT_RE.test(text)) && KNOWN_FILE_EXTENSIONS.has(ext))) {
-        const resolved = text.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(text)
-          ? text
-          : resolveBase ? `${resolveBase.replace(/\/$/, '')}/${text}` : text;
-        const fileName = text.split(/[\\/]/).pop() || text;
+        return <ResolvablePathChip candidate={text} base={resolveBase} />;
+      }
+      // Path-shaped text whose last segment has no known extension
+      // (C:/GitProject/ToCC, src/components) — treat as a directory
+      // candidate; checkFileAccess only succeeds if it really is one.
+      if (DIR_CANDIDATE_RE.test(text) && looksLikeDirectory(text)) {
         return (
-          <button
-            onClick={(e) => {
-              if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
-                bridge.openWithDefaultApp(resolved);
-              } else {
-                useFileStore.getState().selectFile(resolved);
-              }
-            }}
-            onContextMenu={(e) => {
-              if (e.ctrlKey || e.metaKey) {
-                e.preventDefault();
-                bridge.revealInFinder(resolved);
-              }
-            }}
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
-              bg-accent/10 border border-accent/25 rounded-md
-              text-xs text-accent font-medium cursor-pointer
-              hover:bg-accent/20 hover:border-accent/40
-              transition-all duration-150 select-none
-              align-baseline leading-normal whitespace-nowrap"
-            title={resolved}
-          >
-            <span className="text-[10px]">📄</span>
-            <span className="max-w-[180px] truncate">{fileName}</span>
-          </button>
+          <ResolvableFolderChip
+            candidate={text.replace(/[\\/]+$/, '')}
+            base={resolveBase}
+          />
         );
       }
       return <code>{children}</code>;
     },
-  }), [t, resolveBase]);
+  }), [t, resolveBase, pathLinksEnabled]);
 
   return (
     <div className={`prose prose-sm max-w-none

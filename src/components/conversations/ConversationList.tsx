@@ -459,20 +459,30 @@ export function ConversationList() {
 
   // --- Delete handlers ---
   const executeDelete = useCallback(async (sessionId: string, sessionPath: string) => {
-    try {
-      if (sessionPath) {
-        await bridge.deleteSession(sessionId, sessionPath);
-      } else {
-        useSessionStore.getState().removeDraft(sessionId);
-      }
-      if (selectedId === sessionId) {
-        setSelected(null);
-        useChatStore.getState().resetTab(sessionId);
-      }
-      useChatStore.getState().removeFromCache(sessionId);
-      fetchSessions();
-    } catch (err) {
-      console.error('Failed to delete session:', err);
+    // 1) Optimistically close the UI first — never block on backend I/O.
+    //    The conversation disappears instantly; disk cleanup happens below.
+    const tab = useChatStore.getState().getTab(sessionId);
+    if (selectedId === sessionId) {
+      setSelected(null);
+      useChatStore.getState().resetTab(sessionId);
+    }
+    useChatStore.getState().removeFromCache(sessionId);
+    useSessionStore.getState().removeSessionLocal(sessionId);
+
+    // 2) Kill the live CLI process if one exists, so it doesn't linger
+    //    and recreate the jsonl we are about to delete.
+    if (tab?.sessionMeta?.stdinId) {
+      bridge.killSession(tab.sessionMeta.stdinId).catch(() => {});
+      useSessionStore.getState().unregisterStdinTab(tab.sessionMeta.stdinId);
+    }
+
+    // 3) Delete from disk in the background. On failure, re-sync from disk
+    //    so the list reflects reality again.
+    if (sessionPath) {
+      bridge.deleteSession(sessionId, sessionPath).catch(() => {
+        console.error('Failed to delete session:', sessionId);
+        fetchSessions();
+      });
     }
   }, [selectedId, setSelected, fetchSessions]);
 

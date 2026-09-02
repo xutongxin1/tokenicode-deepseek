@@ -33,6 +33,8 @@ import { PlanReviewCard } from './PlanReviewCard';
 import { PermissionCard } from './PermissionCard';
 import { QuestionCard } from './QuestionCard';
 import { TiptapEditor, type TiptapEditorHandle } from './TiptapEditor';
+import type { EditorView } from '@tiptap/pm/view';
+import { BtwPopover } from './BtwPopover';
 import { open } from '@tauri-apps/plugin-dialog';
 // drag-state import removed — tree drag handled by ChatPanel
 
@@ -170,14 +172,12 @@ function PlanToggleButton() {
    is the proper plan approval UI. The fallback bar was too broad: it appeared on
    every completed session in plan/bypass mode, even without a real plan. */
 
-/** Convert absolute file paths to quoted space-separated relative paths for chat insertion.
- *  Normalises backslashes to forward slashes. If cwd is set, paths under cwd become relative. */
-function formatFilePathsForInsert(paths: string[], cwd?: string | null): string {
+/** Quote space-separated ABSOLUTE file paths for chat insertion.
+ *  Normalises backslashes to forward slashes. Paths stay absolute — the CLI
+ *  resolves them regardless of its own cwd. */
+function formatFilePathsForInsert(paths: string[], _cwd?: string | null): string {
   return paths.map((p) => {
-    let display = p.replace(/\\/g, '/');
-    if (cwd && p.startsWith(cwd)) {
-      display = p.slice(cwd.length).replace(/^[\\/]/, '').replace(/\\/g, '/');
-    }
+    const display = p.replace(/\\/g, '/');
     return `"${display}"`;
   }).join(' ') + ' ';
 }
@@ -343,12 +343,9 @@ export function InputBar() {
         const formatted = formatFilePathsForInsert([fullPath], cwd);
         textareaRef.current.insertTextAtCursor(formatted);
       } else {
-        // Original behaviour: insert a FileChip
-        let displayPath = fullPath;
-        if (cwd && fullPath.startsWith(cwd)) {
-          displayPath = fullPath.slice(cwd.length).replace(/^[\\/]/, '');
-        }
-        textareaRef.current.insertFileChip({ fullPath, label: displayPath });
+        // Insert a FileChip — label keeps the ABSOLUTE path so the chip and
+        // the serialized text both carry the full path.
+        textareaRef.current.insertFileChip({ fullPath, label: fullPath });
       }
     };
     window.addEventListener('tokenicode:tree-file-inline', onTreeFileInline);
@@ -372,6 +369,8 @@ export function InputBar() {
   // Rewind state
   const [showRewindPanel, setShowRewindPanel] = useState(false);
   const { showRewind, canRewind } = useRewind();
+  // /btw side-question popover state
+  const [btwOpen, setBtwOpen] = useState(false);
   // lastEscTime removed — double-Esc rewind disabled (#36/#71)
 
   // Listen for rewind event from /rewind command
@@ -1525,15 +1524,17 @@ export function InputBar() {
     return null;
   }, []);
 
-  /** Insert quoted paths at the cursor (used by paste + drag paths) */
-  const insertPaths = useCallback((paths: string[]) => {
+  /** Insert quoted paths at the cursor (used by paste + drag paths).
+   *  An explicit selection (captured from the ProseMirror view at paste
+   *  time) pins the insertion point — see handlePaste. */
+  const insertPaths = useCallback((paths: string[], sel?: { from: number; to: number }) => {
     if (!textareaRef.current || paths.length === 0) return;
     const cwd = useSettingsStore.getState().workingDirectory;
     const formatted = formatFilePathsForInsert(paths, cwd);
-    textareaRef.current.insertTextAtCursor(formatted);
+    textareaRef.current.insertTextAtCursor(formatted, sel);
   }, []);
 
-  const handlePaste = useCallback((e: ClipboardEvent) => {
+  const handlePaste = useCallback((e: ClipboardEvent, view?: EditorView) => {
     const clipboard = e.clipboardData;
     const pasteFileAsPath = useSettingsStore.getState().pasteFileAsPath;
 
@@ -1548,6 +1549,13 @@ export function InputBar() {
       return false;
     }
 
+    // The paste-time selection from the ProseMirror view is the authoritative
+    // insertion point — it is exactly where the browser would have pasted,
+    // regardless of focus state or stale saved cursor positions.
+    const pasteSelection = view
+      ? { from: view.state.selection.from, to: view.state.selection.to }
+      : undefined;
+
     // Setting ON: try to extract file paths from the clipboard → insert as text.
     // On Windows WebView2, paste events expose NO clipboardData.files (unlike
     // drag events), so JS extraction alone is not enough — the native
@@ -1555,7 +1563,7 @@ export function InputBar() {
     const paths = extractFilePathsFromClipboard(e);
     if (paths && paths.length > 0) {
       e.preventDefault();
-      insertPaths(paths);
+      insertPaths(paths, pasteSelection);
       return true;
     }
 
@@ -1568,7 +1576,7 @@ export function InputBar() {
     if (hasFileSignal) {
       e.preventDefault();
       bridge.readClipboardFilePaths().then((nativePaths) => {
-        if (nativePaths.length > 0) insertPaths(nativePaths);
+        if (nativePaths.length > 0) insertPaths(nativePaths, pasteSelection);
         // If paths unavailable, silently do nothing (don't paste file content)
       });
       return true;
@@ -1577,17 +1585,24 @@ export function InputBar() {
     // No file signal — likely a plain text paste. Let the default paste proceed
     // (text keeps working), and check the native clipboard asynchronously: if
     // it turns out to be a file clipboard (Windows Explorer copy), restore the
-    // pre-paste snapshot and insert the paths instead of the file name text.
+    // pre-paste snapshot AND the pre-paste cursor, then insert the paths at
+    // that same pre-paste position.
     const editor = textareaRef.current?.getEditor?.();
     const snapshot = editor?.getHTML() ?? null;
+    const prePasteSelection = editor ? { from: editor.state.selection.from, to: editor.state.selection.to } : null;
     bridge.readClipboardFilePaths().then((nativePaths) => {
       if (nativePaths.length === 0) return;
       const ed = textareaRef.current?.getEditor?.();
       if (!ed) return;
       if (snapshot !== null && ed.getHTML() !== snapshot) {
         ed.commands.setContent(snapshot, { emitUpdate: false });
+        // setContent resets the selection to the document start — restore the
+        // cursor to where it was before the default paste fired.
+        if (prePasteSelection && prePasteSelection.to <= ed.state.doc.content.size) {
+          ed.commands.setTextSelection(prePasteSelection);
+        }
       }
-      insertPaths(nativePaths);
+      insertPaths(nativePaths, prePasteSelection ?? undefined);
     });
     return false;
   }, [addFiles, extractFilePathsFromClipboard, insertPaths]);
@@ -1657,6 +1672,7 @@ export function InputBar() {
 
         {/* Main input area */}
         <div className="relative">
+          <BtwPopover open={btwOpen} onClose={() => setBtwOpen(false)} />
           <SlashCommandPopover
             query={slashQuery}
             visible={slashVisible}
@@ -1736,6 +1752,20 @@ export function InputBar() {
                   useChatStore.getState().setSessionMeta(stopTabId, { stdinId: undefined });
                   useChatStore.getState().setSessionStatus(stopTabId, 'completed');
                   useChatStore.getState().setActivityStatus(stopTabId, { phase: 'completed' });
+                  // Demote in-progress todo items so the floating todo panel
+                  // disappears — the interrupted run isn't progressing anymore.
+                  const stopTab = useChatStore.getState().tabs.get(stopTabId);
+                  const stopMsgs = stopTab?.messages ?? [];
+                  for (let i = stopMsgs.length - 1; i >= 0; i--) {
+                    const m = stopMsgs[i];
+                    if (!m.todoItems?.some((it) => it.status === 'in_progress')) continue;
+                    useChatStore.getState().updateMessage(stopTabId, m.id, {
+                      todoItems: m.todoItems.map((it) =>
+                        it.status === 'in_progress' ? { ...it, status: 'pending' as const } : it,
+                      ),
+                    });
+                    break;
+                  }
                 }
                 if (sid) {
                   await bridge.killSession(sid).catch(() => {});
@@ -1762,6 +1792,26 @@ export function InputBar() {
               </svg>
             </button>
           )}
+          {/* /btw side-question trigger */}
+          <button
+            data-btw-trigger
+            onClick={() => setBtwOpen(!btwOpen)}
+            className={`flex-shrink-0 self-end w-8 h-8 rounded-[10px]
+              flex items-center justify-center transition-smooth
+              ${btwOpen
+                ? 'bg-accent/15 text-accent'
+                : 'text-text-tertiary hover:text-text-primary hover:bg-bg-secondary'
+              }`}
+            title={t('btw.title')}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5">
+              <path d="M2 3.5A1.5 1.5 0 013.5 2h9A1.5 1.5 0 0114 3.5v6a1.5 1.5 0 01-1.5 1.5H6l-3 2.5v-2.5h-.5A1.5 1.5 0 012 9.5v-6z" />
+              <path d="M6.5 6.5c0-.8.7-1.5 1.5-1.5s1.5.7 1.5 1.5c0 .9-1.5 1.1-1.5 2"
+                strokeLinecap="round" />
+              <circle cx="8" cy="10.2" r="0.9" fill="currentColor" stroke="none" />
+            </svg>
+          </button>
           <button
             onClick={handleSubmit}
             disabled={isAwaiting || (!input.trim() && activePrefixes.length === 0)}

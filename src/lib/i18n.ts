@@ -14,7 +14,7 @@ const messages: Record<Locale, Record<string, string>> = {
 
     // Sidebar
     'sidebar.hide': '收起侧栏',
-    'sidebar.newChat': '新任务',
+    'sidebar.newChat': '在当前文件夹新建对话',
     'sidebar.addProject': '添加文件夹',
     'sidebar.addProjectTitle': '添加现有文件夹创建项目',
     'sidebar.currentSession': '当前会话',
@@ -53,6 +53,14 @@ const messages: Record<Locale, Record<string, string>> = {
     'think.providerIgnored': '当前供应商可能不支持 thinking 设置',
     'input.shortcutHint': '⏎ 发送 · {mod}⏎ 换行',
     'input.shortcutHintCtrlEnter': '⏎ 换行 · {mod}⏎ 发送',
+
+    // BtwPopover (顺带一问 — side questions, /btw equivalent)
+    'btw.title': '顺带一问',
+    'btw.placeholder': '输入与当前对话相关的快速问题…',
+    'btw.ask': '提问',
+    'btw.thinking': '正在思考…',
+    'btw.empty': '还没有顺带一问的记录',
+    'btw.error': '回答失败',
 
     // MessageBubble
     'msg.thinking': '思考中...',
@@ -234,8 +242,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'error.cliExitedSilently': 'CLI 意外退出且无输出，请检查 CLI 是否已正确安装（设置 → CLI），以及 API 服务商是否已配置。',
 
     // CommandPalette
-    'cmd.newChat': '新任务',
-    'cmd.newChatDesc': '开始新任务',
+    'cmd.newChat': '在当前文件夹新建对话',
+    'cmd.newChatDesc': '在当前文件夹新建对话',
     'cmd.toggleSidebar': '切换侧栏',
     'cmd.toggleSidebarDesc': '显示或隐藏侧栏',
     'cmd.toggleFiles': '切换文件面板',
@@ -406,6 +414,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'settings.pasteFileAsPathHint': '启用后，从文件管理器复制的文件/文件夹粘贴到输入框时，将插入带引号的绝对路径文本（而非作为附件）。拖拽文件也会使用相同行为。',
     'settings.pasteImagesAsPath': '粘贴图片时也插入绝对路径',
     'settings.pasteImagesAsPathHint': '启用后，粘贴和拖拽图片也会插入带引号的绝对路径文本，而非显示为缩略图附件。仅在开启"粘贴文件时插入绝对路径"后可用。',
+    'settings.pathLinks': '对话中的文件路径渲染为可点击链接',
+    'settings.pathLinksHint': '开启后，对话中的文件与文件夹路径（绝对路径、相对路径）会渲染为可点击的路径标签：单击文件可在右侧面板预览，单击文件夹可在文件管理器中定位。关闭后路径显示为普通文本。',
     'settings.showHiddenFiles': '在文件栏显示点开头的文件与文件夹',
     'settings.showHiddenFilesHint': '开启后，文件栏会显示名称以点开头的文件夹（如 .output）和隐藏文件。与文件栏标题栏的眼睛按钮同步。',
     'settings.advanced': '高级设置',
@@ -791,7 +801,7 @@ const messages: Record<Locale, Record<string, string>> = {
 
     // Sidebar
     'sidebar.hide': 'Hide sidebar',
-    'sidebar.newChat': 'New Task',
+    'sidebar.newChat': 'New Chat in Current Folder',
     'sidebar.addProject': 'Add folder',
     'sidebar.addProjectTitle': 'Add existing folder as project',
     'sidebar.currentSession': 'Current Session',
@@ -1011,8 +1021,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'error.cliExitedSilently': 'CLI process exited unexpectedly without output. Please check that Claude CLI is installed correctly (Settings → CLI) and that your API provider is configured.',
 
     // CommandPalette
-    'cmd.newChat': 'New Task',
-    'cmd.newChatDesc': 'Start a new task',
+    'cmd.newChat': 'New Chat in Current Folder',
+    'cmd.newChatDesc': 'Start a new chat in the current folder',
     'cmd.toggleSidebar': 'Toggle Sidebar',
     'cmd.toggleSidebarDesc': 'Show or hide the sidebar',
     'cmd.toggleFiles': 'Toggle File Panel',
@@ -1062,6 +1072,14 @@ const messages: Record<Locale, Record<string, string>> = {
     'input.processingFiles': 'Processing...',
     'input.stop': 'Stop',
     'input.awaitingInteraction': 'Awaiting interaction response',
+
+    // BtwPopover (side questions, /btw equivalent)
+    'btw.title': 'Side Question',
+    'btw.placeholder': 'Ask a quick question about this conversation…',
+    'btw.ask': 'Ask',
+    'btw.thinking': 'Thinking…',
+    'btw.empty': 'No side questions yet',
+    'btw.error': 'Failed to answer',
 
     // Rewind
     'rewind.title': 'Rewind',
@@ -1183,6 +1201,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'settings.pasteFileAsPathHint': 'When enabled, pasting files/folders from file manager inserts their quoted absolute paths instead of attaching them. Drag-and-drop follows the same behavior.',
     'settings.pasteImagesAsPath': 'Also paste images as absolute paths',
     'settings.pasteImagesAsPathHint': 'When enabled, pasting and dragging images also inserts their quoted absolute paths instead of showing thumbnail attachments. Only available when "Paste files as absolute paths" is enabled above.',
+    'settings.pathLinks': 'Render file paths in chat as clickable links',
+    'settings.pathLinksHint': 'When enabled, file and folder paths in conversations (absolute or relative) render as clickable chips: click a file to preview it in the side panel, click a folder to reveal it in the file manager. When disabled, paths render as plain text.',
     'settings.showHiddenFiles': 'Show dot-prefixed files and folders in the file tree',
     'settings.showHiddenFilesHint': 'When enabled, the file tree shows folders whose names start with a dot (e.g. .output) and hidden files. Synced with the eye button in the file tree header.',
     'settings.advanced': 'Advanced',

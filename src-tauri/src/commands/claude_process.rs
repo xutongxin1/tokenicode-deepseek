@@ -166,4 +166,10 @@ pub struct StartSessionParams {
     /// When not "bypassPermissions", enables --permission-prompt-tool stdio for structured
     /// permission requests via the SDK control protocol.
     pub permission_mode: Option<String>,
+    /// Side question ("/btw" equivalent): spawns an independent one-shot CLI
+    /// process with ALL tools disabled (canUseTool: deny), the official
+    /// side-question system reminder appended, and events routed to the
+    /// dedicated `claude:btw:*` channels instead of the main stream.
+    /// The session is never tracked, so it stays out of the session list.
+    pub is_sidechain: Option<bool>,
 }

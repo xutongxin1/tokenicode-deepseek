@@ -12,6 +12,9 @@ import { PermissionCard } from './PermissionCard';
 import { QuestionCard } from './QuestionCard';
 import { AiAvatar } from '../shared/AiAvatar';
 import { UserAvatar } from '../shared/UserAvatar';
+import {
+  FILE_PATH_RE, FOLDER_PATH_RE, KNOWN_EXT_RE, DIR_CANDIDATE_RE, looksLikeDirectory,
+} from '../../lib/path-links';
 
 interface Props {
   message: ChatMessage;
@@ -59,18 +62,27 @@ function getFileExt(name: string): string {
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
 }
 
-/** Detect file paths in inline code — same regexes as MarkdownRenderer */
-const FILE_PATH_RE = /^(?:\/|\.\/|\.\.\/|[a-zA-Z]:[/\\]|src\/|lib\/|components\/|stores\/|hooks\/|utils\/|tests\/|__tests__\/)[\w.@/-]+\.\w{1,10}$/;
-const KNOWN_EXT_RE = /^[\w][\w.-]*\.(?:md|mdx|ts|tsx|js|jsx|mjs|cjs|json|jsonl|toml|yaml|yml|py|pyi|rs|go|html|htm|css|scss|sass|less|vue|svelte|sh|bash|zsh|fish|env|conf|cfg|ini|xml|sql|graphql|gql|proto|lock|log|txt|csv|rb|php|java|kt|swift|c|cpp|h|hpp|cs|r|lua|zig|ex|exs|erl|ml|mli|tf|hcl|dockerfile|makefile)$/i;
+/** Detect file paths in inline code — shared regexes (src/lib/path-links.ts) */
 
 /** Render a single backtick-inner segment: file path → clickable chip, else → inline code */
 function renderCodeSegment(inner: string, key: number): ReactNode {
-  if (FILE_PATH_RE.test(inner) || KNOWN_EXT_RE.test(inner)) {
-    const wd = useSettingsStore.getState().workingDirectory || '';
-    const resolved = inner.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(inner)
-      ? inner
-      : wd ? `${wd.replace(/\/$/, '')}/${inner}` : inner;
-    const fileName = inner.split(/[\\/]/).pop() || inner;
+  // Settings: path chips disabled → plain inline code for everything
+  if (!useSettingsStore.getState().pathLinksEnabled) {
+    return (
+      <code key={key} className="px-1.5 py-0.5 mx-0.5 rounded-md text-[13px]
+        bg-white/15 border border-white/20 font-mono">
+        {inner}
+      </code>
+    );
+  }
+  const wd = useSettingsStore.getState().workingDirectory || '';
+  const resolveAbs = (p: string) => (p.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(p)
+    ? p
+    : wd ? `${wd.replace(/\/$/, '')}/${p}` : p);
+  // Truncated paths with leading ellipses (`.../foo.jsonl`) are not real paths
+  const isTruncated = inner.startsWith('...');
+  if (!isTruncated && (FILE_PATH_RE.test(inner) || KNOWN_EXT_RE.test(inner))) {
+    const resolved = resolveAbs(inner);
     return (
       <button
         key={key}
@@ -97,7 +109,41 @@ function renderCodeSegment(inner: string, key: number): ReactNode {
         title={resolved}
       >
         <span className="text-[10px]">📄</span>
-        <span className="max-w-[180px] truncate">{fileName}</span>
+        <span className="max-w-[240px] truncate">{resolved}</span>
+      </button>
+    );
+  }
+  if (FOLDER_PATH_RE.test(inner)
+    || (DIR_CANDIDATE_RE.test(inner) && looksLikeDirectory(inner))) {
+    const cleaned = inner.replace(/[\\/]+$/, '');
+    const resolved = resolveAbs(cleaned);
+    return (
+      <button
+        key={key}
+        onClick={(e) => {
+          e.stopPropagation();
+          if ((e.ctrlKey || e.metaKey) && useSettingsStore.getState().ctrlClickOpenExternally) {
+            bridge.openWithDefaultApp(resolved);
+          } else {
+            bridge.revealInFinder(resolved);
+          }
+        }}
+        onContextMenu={(e) => {
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            bridge.revealInFinder(resolved);
+          }
+        }}
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
+          bg-white/15 border border-white/25 rounded-md
+          text-xs font-medium cursor-pointer
+          hover:bg-white/25 hover:border-white/40
+          transition-all duration-150 select-none
+          align-baseline leading-normal whitespace-nowrap inline-block"
+        title={resolved}
+      >
+        <span className="text-[10px]">📁</span>
+        <span className="max-w-[240px] truncate">{resolved}/</span>
       </button>
     );
   }
@@ -134,6 +180,9 @@ function renderUserContent(text: string): ReactNode {
 
 function UserMsg({ message }: Props) {
   const t = useT();
+  // Re-render user messages when the path-chip setting toggles —
+  // renderCodeSegment reads it via getState() (module-level helper).
+  useSettingsStore((s) => s.pathLinksEnabled);
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const attachments = message.attachments;
@@ -1018,8 +1067,10 @@ function PlanMsg({ message }: Props) {
 
 /* ================================================================
    TodoMsg — tree-style with indent connector lines (Claude Code style)
+   Also rendered as a floating panel pinned to the chat area's top-right
+   while an item is in progress (floating prop).
    ================================================================ */
-function TodoMsg({ message }: Props) {
+export function TodoMsg({ message, floating = false }: Props & { floating?: boolean }) {
   const t = useT();
   const [expanded, setExpanded] = useState(true);
   const items = Array.isArray(message.todoItems) ? message.todoItems : [];
@@ -1027,11 +1078,12 @@ function TodoMsg({ message }: Props) {
   const inProgressItem = items.find((i) => i.status === 'in_progress');
 
   return (
-    <div className="ml-11">
+    <div className={floating ? '' : 'ml-11'}>
       {/* Header — collapsible */}
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1.5 py-1 cursor-pointer text-left"
+        className={`flex items-center gap-1.5 py-1 cursor-pointer text-left
+          ${floating ? 'w-full px-2.5 pt-2' : ''}`}
       >
         <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
           stroke="currentColor" strokeWidth="1.5"
@@ -1040,6 +1092,10 @@ function TodoMsg({ message }: Props) {
           <path d="M3 2l4 3-4 3" />
         </svg>
         <span className="text-xs font-bold text-text-primary">{t('msg.todo')}</span>
+        {inProgressItem && (
+          <span className="inline-block w-2 h-2 rounded-full bg-accent animate-todo-dot
+            flex-shrink-0" />
+        )}
         <span className="text-[10px] text-text-tertiary">
           {completedCount}/{items.length}
         </span>
@@ -1051,31 +1107,32 @@ function TodoMsg({ message }: Props) {
       </button>
       {/* Tree-style checklist with connector lines */}
       {expanded && (
-        <div className="ml-[7px] mt-0.5">
+        <div className={`ml-[7px] mt-0.5 ${floating ? 'pr-2.5 pb-2' : ''}`}>
           {items.map((item, i) => {
             const isLast = i === items.length - 1;
             return (
               <div key={i} className="flex items-stretch">
-                {/* Connector line column */}
-                <div className="flex flex-col items-center w-4 flex-shrink-0">
-                  {/* Horizontal branch + vertical trunk */}
-                  <div className="flex items-center h-5">
-                    <div className={`w-px h-full ${isLast ? 'h-1/2 self-start' : ''}`}
-                      style={{
-                        background: 'var(--color-border)',
-                        height: isLast ? '50%' : '100%',
-                        alignSelf: isLast ? 'flex-start' : undefined,
-                      }}
-                    />
-                    <div className="w-2 h-px" style={{ background: 'var(--color-border)' }} />
-                  </div>
-                  {/* Continuing trunk below (hidden for last item) */}
-                  {!isLast && (
-                    <div className="w-px flex-1" style={{ background: 'var(--color-border)' }} />
-                  )}
+                {/* Connector line column — vertical trunk spans the full row
+                    height; the horizontal branch sits at the icon's vertical
+                    center so it stays aligned when text wraps to multiple
+                    lines (icon column is items-start, matching the branch). */}
+                <div className="relative w-4 flex-shrink-0">
+                  <div
+                    className="absolute left-[7px] w-px"
+                    style={{
+                      background: 'var(--color-border)',
+                      top: 0,
+                      ...(isLast ? { height: 17 } : { bottom: 0 }),
+                    }}
+                  />
+                  <div
+                    className="absolute left-[7px] top-[8px] w-[9px] h-px"
+                    style={{ background: 'var(--color-border)' }}
+                  />
                 </div>
                 {/* Status icon + text */}
-                <div className="flex items-center gap-1.5 py-0.5 min-h-[20px]">
+                <div className="flex items-start gap-1.5 pt-[2.5px] pb-1
+                  min-h-[20px] flex-1 min-w-0">
                   {item.status === 'completed' ? (
                     <svg width="11" height="11" viewBox="0 0 12 12" fill="none"
                       className="flex-shrink-0">
@@ -1087,8 +1144,8 @@ function TodoMsg({ message }: Props) {
                     </svg>
                   ) : item.status === 'in_progress' ? (
                     <span className="w-[11px] h-[11px] flex items-center justify-center flex-shrink-0">
-                      <span className="w-2.5 h-2.5 rounded-full border-2 border-accent
-                        bg-accent/20 animate-pulse-soft" />
+                      <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-accent
+                        bg-accent/20 animate-todo-dot" />
                     </span>
                   ) : (
                     <svg width="11" height="11" viewBox="0 0 12 12" fill="none"
@@ -1098,7 +1155,7 @@ function TodoMsg({ message }: Props) {
                         strokeOpacity="0.4" />
                     </svg>
                   )}
-                  <span className={`text-[11px] leading-tight
+                  <span className={`text-[11px] leading-tight break-words min-w-0
                     ${item.status === 'completed'
                       ? 'text-text-tertiary line-through'
                       : item.status === 'in_progress'

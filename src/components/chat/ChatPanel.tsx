@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
 import { useChatStore, useActiveTab, generateMessageId, type ChatMessage, type SessionMeta } from '../../stores/chatStore';
-import { MessageBubble } from './MessageBubble';
+import { MessageBubble, TodoMsg } from './MessageBubble';
 import { ToolGroup } from './ToolGroup';
 import { InputBar } from './InputBar';
 import { ExportMenu } from '../conversations/ExportMenu';
@@ -480,6 +480,19 @@ export function ChatPanel() {
   const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
   const sessions = useSessionStore((s) => s.sessions);
   const isFilePreviewMode = !!useFileStore((s) => s.selectedFile);
+
+  // Currently-running todo message — the latest todo update that still has an
+  // in-progress item. Pinned to the top-right of the chat area (floating
+  // TodoMsg panel). Disappears automatically once nothing is in progress.
+  const activeTodoMsg = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const items = messages[i].todoItems;
+      if (!items || items.length === 0) continue;
+      if (!items.some((it) => it.status === 'in_progress')) return null;
+      return messages[i];
+    }
+    return null;
+  }, [messages]);
 
   // Agent activity for floating button badge
   const agents = useAgentStore((s) => s.agents);
@@ -1009,6 +1022,20 @@ export function ChatPanel() {
           onJumpTurn={jumpToTurn}
           onJumpBottom={scrollToBottom}
         />
+      )}
+
+      {/* Pinned running-todo panel — floats at the top-right of the chat area
+          (left of the secondary panel). Full checklist with statuses, in the
+          same tree style as in-conversation todo messages. Collapsible;
+          disappears when the last item completes. */}
+      {activeTodoMsg && (
+        <div className="absolute top-3 right-3 z-20 max-w-[340px] w-fit">
+          <div className="rounded-xl bg-bg-card/95 backdrop-blur-sm border
+            border-border-subtle shadow-lg overflow-hidden
+            animate-todo-breathe">
+            <TodoMsg message={activeTodoMsg} floating />
+          </div>
+        </div>
       )}
 
       {/* Scroll to bottom FAB */}
