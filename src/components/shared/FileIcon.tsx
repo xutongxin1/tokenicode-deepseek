@@ -80,6 +80,8 @@ export function FileIcon({ name, isDir, size = 14, className = '' }: FileIconPro
       strokeLinecap="round"
       strokeLinejoin="round"
       className={className}
+      data-icon-type={type}
+      aria-hidden="true"
     >
       <path d={d} />
     </svg>

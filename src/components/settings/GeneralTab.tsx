@@ -172,6 +172,8 @@ export function GeneralTab() {
   const togglePasteFileAsPath = useSettingsStore((s) => s.togglePasteFileAsPath);
   const pasteImagesAsPath = useSettingsStore((s) => s.pasteImagesAsPath);
   const togglePasteImagesAsPath = useSettingsStore((s) => s.togglePasteImagesAsPath);
+  const pathLinksEnabled = useSettingsStore((s) => s.pathLinksEnabled);
+  const togglePathLinks = useSettingsStore((s) => s.togglePathLinks);
   const showHiddenFiles = useSettingsStore((s) => s.showHiddenFiles);
   const toggleHiddenFiles = useSettingsStore((s) => s.toggleHiddenFiles);
   const aiAvatarUrl = useSettingsStore((s) => s.aiAvatarUrl);
@@ -654,6 +656,27 @@ export function GeneralTab() {
           </button>
           <p className="mt-1 text-[11px] text-text-tertiary leading-relaxed">
             {t('settings.pasteImagesAsPathHint')}
+          </p>
+        </div>
+
+        {/* Render file/folder paths in chat as clickable chips */}
+        <div>
+          <button
+            onClick={togglePathLinks}
+            className="inline-flex items-center gap-2 text-[12px] text-text-secondary
+              hover:text-text-primary transition-smooth"
+          >
+            <span className={`relative w-8 h-4 rounded-full transition-smooth border
+              ${pathLinksEnabled ? 'bg-accent/80 border-accent/30' : 'bg-bg-tertiary border-border-subtle'}`}
+            >
+              <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white shadow-sm transition-all
+                ${pathLinksEnabled ? 'right-0.5' : 'left-0.5'}`}
+              />
+            </span>
+            {t('settings.pathLinks')}
+          </button>
+          <p className="mt-1 text-[11px] text-text-tertiary leading-relaxed">
+            {t('settings.pathLinksHint')}
           </p>
         </div>
 

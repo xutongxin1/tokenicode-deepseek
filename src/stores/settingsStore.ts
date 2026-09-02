@@ -122,6 +122,8 @@ interface SettingsState {
   pasteFileAsPath: boolean;
   /** When pasteFileAsPath is on, also insert image paths instead of attaching */
   pasteImagesAsPath: boolean;
+  /** Whether file/folder paths in chat messages render as clickable chips */
+  pathLinksEnabled: boolean;
 
   // ── Custom background (user-uploaded image) ──
   /** Base64 data URL of user-uploaded custom background image, empty = disabled */
@@ -179,6 +181,7 @@ interface SettingsState {
   removeSkillDirectory: (path: string) => void;
   togglePasteFileAsPath: () => void;
   togglePasteImagesAsPath: () => void;
+  togglePathLinks: () => void;
   setCustomBgImage: (image: string) => void;
   setCustomBgSize: (size: 'cover' | 'contain' | 'fill') => void;
   setCustomBgPositionX: (x: number) => void;
@@ -239,6 +242,7 @@ export const useSettingsStore = create<SettingsState>()(
       skillDirectories: [],
       pasteFileAsPath: false,
       pasteImagesAsPath: false,
+      pathLinksEnabled: true,
       customBgImage: '',
       customBgSize: 'cover',
       customBgPositionX: 50,
@@ -384,10 +388,13 @@ export const useSettingsStore = create<SettingsState>()(
         set((state) => ({ pasteFileAsPath: !state.pasteFileAsPath })),
       togglePasteImagesAsPath: () =>
         set((state) => ({ pasteImagesAsPath: !state.pasteImagesAsPath })),
+
+      togglePathLinks: () =>
+        set((state) => ({ pathLinksEnabled: !state.pathLinksEnabled })),
     }),
     {
       name: 'tokenicode-settings',
-      version: 15,
+      version: 16,
       migrate: (persistedState: unknown, version: number) => {
         const persisted = persistedState as Record<string, unknown>;
         if (version === 0) {
@@ -469,6 +476,10 @@ export const useSettingsStore = create<SettingsState>()(
           persisted.pasteFileAsPath = false;
           persisted.pasteImagesAsPath = false;
         }
+        if (version < 16) {
+          // Path chips existed before the toggle — keep them on for upgraders
+          persisted.pathLinksEnabled = true;
+        }
         return persisted;
       },
       partialize: (state) => ({
@@ -502,6 +513,7 @@ export const useSettingsStore = create<SettingsState>()(
         skillDirectories: state.skillDirectories,
         pasteFileAsPath: state.pasteFileAsPath,
         pasteImagesAsPath: state.pasteImagesAsPath,
+        pathLinksEnabled: state.pathLinksEnabled,
         customBgImage: state.customBgImage,
         customBgSize: state.customBgSize,
         customBgPositionX: state.customBgPositionX,

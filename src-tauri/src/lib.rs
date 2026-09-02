@@ -1363,6 +1363,23 @@ fn resolve_provider_env(
     Ok((env, keys_to_remove, extra_args))
 }
 
+/// System reminder injected into side-question (/btw) CLI processes.
+/// Extracted verbatim from the Claude Code CLI binary (runSideQuestion).
+const SIDE_QUESTION_REMINDER: &str = "\
+This is a side question from the user. You must answer this question directly in a single response.\n\
+IMPORTANT CONTEXT:\n\
+- You are a separate, lightweight agent spawned to answer this one question\n\
+- The main agent is NOT interrupted - it continues working independently in the background\n\
+- You share the conversation context but are a completely separate instance\n\
+- Do NOT reference being interrupted or what you were \"previously doing\" - that framing is incorrect\n\
+CRITICAL CONSTRAINTS:\n\
+- You have NO tools available - you cannot read files, run commands, search, or take any actions\n\
+- This is a one-off response - there will be no follow-up turns\n\
+- You can ONLY provide information based on what you already know from the conversation context\n\
+- NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me check...\", or promise to take any action\n\
+- If you don't know the answer, say so - do not offer to look it up or investigate\n\
+Simply answer the question with the information you have.";
+
 #[tauri::command]
 async fn start_claude_session(
     app: AppHandle,
@@ -1393,6 +1410,20 @@ async fn start_claude_session(
         // overhead as each must initialize before the CLI accepts input.
         "--strict-mcp-config".to_string(),
     ];
+
+    // Side question (/btw) — replicate Claude Code's official side-question
+    // behaviour: an independent one-shot query with NO tools available.
+    let is_sidechain = params.is_sidechain.unwrap_or(false);
+    if is_sidechain {
+        // Disable ALL built-in tools (official side questions run with
+        // canUseTool: deny — the model may only answer from context).
+        args.push("--tools".to_string());
+        args.push(String::new());
+        // Official side-question system reminder, extracted verbatim from the
+        // Claude Code CLI binary (runSideQuestion's injected system prompt).
+        args.push("--append-system-prompt".to_string());
+        args.push(SIDE_QUESTION_REMINDER.to_string());
+    }
 
     // Resume an existing CLI session if requested
     if let Some(ref resume_id) = params.resume_session_id {
@@ -1774,7 +1805,11 @@ async fn start_claude_session(
     let stdin_clone = stdin_mgr.inner().clone();
     let is_bypass = permission_mode == "bypassPermissions";
     tokio::spawn(async move {
-        let stream_event = format!("claude:stream:{}", sid_clone);
+        let stream_event = format!(
+            "{}:{}",
+            if is_sidechain { "claude:btw" } else { "claude:stream" },
+            sid_clone
+        );
         // Use a large buffer (1MB) to efficiently read large NDJSON lines from Claude CLI.
         // Default 8KB buffer causes thousands of syscalls for large outputs (e.g. 24.8MB PDF),
         // which stalls on Windows pipes. 1MB buffer reduces syscalls by ~125x.
@@ -1863,6 +1898,22 @@ async fn start_claude_session(
 
                     match subtype {
                         "can_use_tool" => {
+                            // Side questions have no tools (--tools "") — if a
+                            // request still arrives, deny it outright instead of
+                            // surfacing a permission card (matches official
+                            // canUseTool: deny semantics).
+                            if is_sidechain {
+                                let deny_resp = serde_json::json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "success",
+                                        "request_id": request_id,
+                                        "response": { "behavior": "deny", "message": "Tools are not available in side questions" }
+                                    }
+                                });
+                                let _ = stdin_clone.send(&sid_clone, &deny_resp.to_string()).await;
+                                continue;
+                            }
                             let tool_name = request
                                 .get("tool_name")
                                 .or_else(|| request.get("toolName"))
@@ -1990,24 +2041,36 @@ async fn start_claude_session(
         // Also emit on the dedicated exit channel (backup detection via onSessionExit)
         let _ = emit_to_frontend(
             &app_clone,
-            &format!("claude:exit:{}", sid_clone),
+            &format!(
+                "{}:{}",
+                if is_sidechain { "claude:btw:exit" } else { "claude:exit" },
+                sid_clone
+            ),
             serde_json::json!(null),
         );
 
-        // Notify frontend that session list may have changed
-        let _ = emit_to_frontend(&app_clone, "sessions:changed", serde_json::json!(null));
+        // Sidechain sessions are untracked — skip the session-list refresh.
+        if !is_sidechain {
+            // Notify frontend that session list may have changed
+            let _ = emit_to_frontend(&app_clone, "sessions:changed", serde_json::json!(null));
+        }
     });
 
     // Spawn stderr reader
     let app_clone2 = app.clone();
     let sid_clone2 = sid.clone();
     tokio::spawn(async move {
+        let stderr_event = format!(
+            "{}:{}",
+            if is_sidechain { "claude:btw:stderr" } else { "claude:stderr" },
+            sid_clone2
+        );
         let reader = BufReader::with_capacity(256 * 1024, stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let _ = emit_to_frontend(
                 &app_clone2,
-                &format!("claude:stderr:{}", sid_clone2),
+                &stderr_event,
                 serde_json::json!(line),
             );
         }
@@ -4092,9 +4155,10 @@ async fn unwatch_directory(state: State<'_, WatcherManager>, path: String) -> Re
 /// Get file size in bytes for a given path
 #[tauri::command]
 async fn get_file_size(path: String) -> Result<u64, String> {
-    let metadata =
-        std::fs::metadata(&path).map_err(|e| format!("Cannot read file metadata: {}", e))?;
-    Ok(metadata.len())
+    match std::fs::metadata(&path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(e) => Err(format!("Cannot read file metadata: {}", e)),
+    }
 }
 
 /// Save a file to a temp directory and return its path.

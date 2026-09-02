@@ -11,6 +11,10 @@ import { FileIcon } from '../shared/FileIcon';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { showToast } from '../shared/Toast';
 
+/** Fixed height of folder header rows — sticky stacking offsets are
+ *  computed as depth × HEADER_H so ancestor headers freeze in a stack. */
+const HEADER_H = 28;
+
 function getChangeBadge(kind: FileChangeKind | undefined) {
   if (!kind) return null;
   const colors = {
@@ -423,16 +427,52 @@ function TreeNode({
           onContextMenu(e, node.path, node.is_dir);
         }}
         {...(node.is_dir ? { 'data-dir-path': node.path } : {})}
-        className={`w-full flex items-center gap-2 py-1.5 px-2 rounded-lg
+        className={`w-full flex items-center gap-2 px-2
           text-left text-[13px] transition-smooth group
+          ${node.is_dir
+            // Sticky folder header: freezes while browsing its children —
+            // click to collapse back into it. Fixed row height so ancestor
+            // headers can stack below each other (top = depth × HEADER_H).
+            // rounded-none so the opaque bar fully covers rows scrolling
+            // underneath (rounded corners would let highlights peek through).
+            ? 'sticky relative bg-bg-card h-7 rounded-none'
+            : 'rounded-lg py-1.5'
+          }
           ${isSelected
-            ? 'bg-accent/10 text-accent'
+            ? node.is_dir
+              // Sticky folder headers never change background on hover or
+              // selection — any tint, even an opaque-looking one, risks
+              // letting rows scrolling underneath bleed through. Highlight
+              // via text/icon color instead (background stays bg-bg-card).
+              ? 'text-accent'
+              : 'bg-accent/10 text-accent'
             : changeKind
               ? 'text-success'
-              : 'text-text-muted hover:bg-bg-secondary hover:text-text-primary'
+              : node.is_dir
+                ? 'text-text-muted hover:text-text-primary'
+                : 'text-text-muted hover:bg-bg-secondary hover:text-text-primary'
           }`}
-        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+        style={{
+          paddingLeft: `${depth * 16 + 8}px`,
+          ...(node.is_dir
+            ? {
+                top: depth * HEADER_H,
+                // Shallower headers paint above deeper ones so nested
+                // headers slide underneath their ancestors when un-sticking.
+                // Bumped above the 30 range so selected/hover highlights on
+                // rows never paint over a stuck header.
+                zIndex: Math.max(1, 40 - depth),
+              }
+            : {}),
+        }}
       >
+        {node.is_dir && isSelected && (
+          <span
+            aria-hidden
+            className="absolute inset-0 rounded-none pointer-events-none
+              border-2 border-accent animate-folder-selected-ring"
+          />
+        )}
         {node.is_dir && (
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
             stroke="currentColor" strokeWidth="1.5"
@@ -558,6 +598,19 @@ export function FileExplorer() {
   }, [tree, showHiddenFiles]);
 
   const changedCount = changedFiles.size;
+
+  // Git-style change stats: +created ~modified -removed
+  const changeStats = useMemo(() => {
+    let created = 0;
+    let modified = 0;
+    let removed = 0;
+    for (const kind of changedFiles.values()) {
+      if (kind === 'created') created++;
+      else if (kind === 'modified') modified++;
+      else removed++;
+    }
+    return { created, modified, removed };
+  }, [changedFiles]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, path: string, isDir: boolean) => {
     setContextMenu({ x: e.clientX, y: e.clientY, path, isDir });
@@ -717,31 +770,58 @@ export function FileExplorer() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2
-        border-b border-border-subtle">
-        <div className="flex items-center gap-2 min-w-0"
-          title={workingDirectory}>
+      {/* Search bar + actions — always at the very top */}
+      <div className="px-2 pt-1.5 pb-1.5 border-b border-border-subtle
+        flex items-center gap-1">
+        <div className="relative flex-1 min-w-0">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
             stroke="currentColor" strokeWidth="1.5"
-            className="text-accent flex-shrink-0">
-            <path d="M2 4h4l2 2h6v7H2V4z" />
+            className="absolute left-2 top-1/2 -translate-y-1/2 text-text-tertiary">
+            <circle cx="7" cy="7" r="5" />
+            <path d="M11 11l3 3" />
           </svg>
-          <div className="min-w-0">
-            <span className="text-[13px] font-medium text-text-primary
-              truncate block">
-              {workingDirectory.split(/[\\/]/).pop()}
-            </span>
-          </div>
-          {changedCount > 0 && (
-            <span className="text-xs px-1.5 py-0.5 rounded-full
-              bg-success/15 text-success
-              font-medium flex-shrink-0">
-              {changedCount} {t('files.changed')}
-            </span>
+          <input
+            ref={searchRef}
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder={t('files.search')}
+            className="w-full pl-7 pr-7 py-1 text-[13px] bg-bg-secondary/50
+              border border-border-subtle rounded-lg text-text-primary
+              placeholder:text-text-tertiary outline-none
+              focus:border-border-focus focus:bg-bg-input
+              transition-smooth"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              className="absolute right-1.5 top-1/2 -translate-y-1/2
+                p-0.5 rounded-lg text-text-tertiary hover:text-text-primary
+                transition-smooth"
+            >
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
+                stroke="currentColor" strokeWidth="1.5">
+                <path d="M2 2l6 6M8 2l-6 6" />
+              </svg>
+            </button>
           )}
         </div>
-        <div className="flex items-center gap-0.5">
+        {changedCount > 0 && (
+          <span className="flex-shrink-0 text-[11px] px-1.5 py-0.5 rounded-full
+            bg-bg-secondary/60 font-mono font-medium whitespace-nowrap"
+            title={t('files.changed')}>
+            {changeStats.created > 0 && (
+              <span className="text-success">+{changeStats.created}</span>
+            )}
+            {changeStats.modified > 0 && (
+              <span className="text-warning"> ~{changeStats.modified}</span>
+            )}
+            {changeStats.removed > 0 && (
+              <span className="text-error"> -{changeStats.removed}</span>
+            )}
+          </span>
+        )}
+        <div className="flex items-center gap-0.5 flex-shrink-0">
           <button onClick={() => handleNewFile(workingDirectory || rootPath)}
             className="p-1.5 rounded-lg hover:bg-bg-secondary active:bg-bg-tertiary
               text-text-tertiary hover:text-text-secondary transition-smooth"
@@ -796,43 +876,6 @@ export function FileExplorer() {
               <path d="M11.5 1v3h-3M2.5 13v-3h3" />
             </svg>
           </button>
-        </div>
-      </div>
-
-      {/* Search bar */}
-      <div className="px-2 py-1.5 border-b border-border-subtle">
-        <div className="relative">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
-            stroke="currentColor" strokeWidth="1.5"
-            className="absolute left-2 top-1/2 -translate-y-1/2 text-text-tertiary">
-            <circle cx="7" cy="7" r="5" />
-            <path d="M11 11l3 3" />
-          </svg>
-          <input
-            ref={searchRef}
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder={t('files.search')}
-            className="w-full pl-7 pr-7 py-1 text-[13px] bg-bg-secondary/50
-              border border-border-subtle rounded-lg text-text-primary
-              placeholder:text-text-tertiary outline-none
-              focus:border-border-focus focus:bg-bg-input
-              transition-smooth"
-          />
-          {searchQuery && (
-            <button
-              onClick={() => setSearchQuery('')}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2
-                p-0.5 rounded-lg text-text-tertiary hover:text-text-primary
-                transition-smooth"
-            >
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
-                stroke="currentColor" strokeWidth="1.5">
-                <path d="M2 2l6 6M8 2l-6 6" />
-              </svg>
-            </button>
-          )}
         </div>
       </div>
 

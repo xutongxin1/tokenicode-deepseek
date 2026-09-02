@@ -87,6 +87,8 @@ interface SessionState {
   getTabForStdin: (stdinId: string) => string | undefined;
   /** Remove a draft session from the local list (no disk deletion needed) */
   removeDraft: (draftId: string) => void;
+  /** Remove a session from the local list without touching disk (optimistic delete) */
+  removeSessionLocal: (sessionId: string) => void;
   /** Promote a draft session to a real session ID (when CLI returns the actual UUID).
    *  Updates session id, selectedSessionId, stdinToTab mapping, and runningSessions. */
   promoteDraft: (oldDraftId: string, newRealId: string) => void;
@@ -227,6 +229,10 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   removeDraft: (draftId) => set((state) => ({
     sessions: state.sessions.filter((s) => s.id !== draftId),
+  })),
+
+  removeSessionLocal: (sessionId) => set((state) => ({
+    sessions: state.sessions.filter((s) => s.id !== sessionId),
   })),
 
   promoteDraft: (oldDraftId, newRealId) => {

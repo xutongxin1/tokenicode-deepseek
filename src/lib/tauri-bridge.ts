@@ -25,6 +25,9 @@ export interface StartSessionParams {
    *  "acceptEdits" | "default" | "plan" | "bypassPermissions"
    *  When not "bypassPermissions", enables structured permission requests via SDK protocol. */
   permission_mode?: string;
+  /** Side question (/btw): spawn an independent one-shot CLI process with all
+   *  tools disabled; events route to `claude:btw:*` channels. */
+  is_sidechain?: boolean;
 }
 
 export interface SessionInfo {
@@ -718,6 +721,40 @@ export function onSessionExit(
 ): Promise<UnlistenFn> {
   return listen<number | null>(
     `claude:exit:${stdinId}`,
+    (event) => callback(event.payload),
+  );
+}
+
+/** Listen for NDJSON stream events from a side-question (/btw) CLI process.
+ *  @param stdinId - Desk-generated process key */
+export function onBtwStream(
+  stdinId: string,
+  callback: (message: any) => void,
+): Promise<UnlistenFn> {
+  return listen<any>(
+    `claude:btw:${stdinId}`,
+    (event) => callback(event.payload),
+  );
+}
+
+/** Listen for stderr output from a side-question (/btw) CLI process. */
+export function onBtwStderr(
+  stdinId: string,
+  callback: (line: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>(
+    `claude:btw:stderr:${stdinId}`,
+    (event) => callback(event.payload),
+  );
+}
+
+/** Listen for side-question (/btw) process exit events. */
+export function onBtwExit(
+  stdinId: string,
+  callback: (code: number | null) => void,
+): Promise<UnlistenFn> {
+  return listen<number | null>(
+    `claude:btw:exit:${stdinId}`,
     (event) => callback(event.payload),
   );
 }
