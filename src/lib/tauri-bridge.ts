@@ -342,6 +342,24 @@ export const bridge = {
   untrackSession: (sessionId: string) =>
     invoke<void>('untrack_session', { sessionId }),
 
+  /** Clone a session JSONL to a new id (optionally truncated before a record
+   *  uuid). Menu clone = full copy, tracked; rewind clone = untracked resume
+   *  target. */
+  cloneSession: (
+    sourcePath: string,
+    truncateBeforeUuid: string | null,
+    track = true,
+  ) =>
+    invoke<{ session_id: string; path: string }>('clone_session', {
+      sourcePath,
+      truncateBeforeUuid,
+      track,
+    }),
+
+  /** Record a fork relationship so loadSession merges the parent history. */
+  linkSessionParent: (childId: string, parentId: string) =>
+    invoke<void>('link_session_parent', { childId, parentId }),
+
   deleteSession: (sessionId: string, sessionPath: string) =>
     invoke<void>('delete_session', { sessionId, sessionPath }),
 

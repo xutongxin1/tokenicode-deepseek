@@ -8,6 +8,7 @@ interface SessionContextMenuProps {
   y: number;
   session: SessionListItem;
   onRename: (session: SessionListItem) => void;
+  onClone: (session: SessionListItem) => void;
   onRevealInFinder: (session: SessionListItem) => void;
   onExport: (session: SessionListItem) => void;
   onDelete: (session: SessionListItem) => void;
@@ -24,6 +25,7 @@ export function SessionContextMenu({
   y,
   session,
   onRename,
+  onClone,
   onRevealInFinder,
   onExport,
   onDelete,
@@ -72,6 +74,21 @@ export function SessionContextMenu({
         </svg>
         {t('conv.rename')}
       </button>
+
+      {onClone && session.path && (
+        <button
+          onClick={() => { onClose(); onClone(session); }}
+          className="w-full flex items-center gap-2.5 px-3 py-1.5
+            text-xs text-text-primary hover:bg-bg-secondary transition-smooth"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="5" y="5" width="9" height="9" rx="2" />
+            <path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5" />
+          </svg>
+          {t('conv.clone')}
+        </button>
+      )}
 
       {onPin && (
         <button

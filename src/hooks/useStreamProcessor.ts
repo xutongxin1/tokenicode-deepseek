@@ -1028,9 +1028,27 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // Persist Claude session UUID for F5 recovery (token totals read from JSONL)
         _persistClaudeUuid(tabId, cliSessionId);
 
-        // Promote draft tab to real session ID so it merges with disk session
-        if (tabId.startsWith('draft_')) {
-          // Migrate tab data under old draft key to new real key
+        // Rewind-on-clone: the first message after a rewind resumes the
+        // intermediate clone C (visible since the rewind); the CLI forks it
+        // into F. Link F→C so load_session can merge C's history, then hide
+        // C (or keep it visible when the resume stayed in place, F === C).
+        const rewindCloneId = useChatStore.getState().getTab(tabId)?.sessionMeta.rewindCloneSessionId;
+        if (rewindCloneId) {
+          if (rewindCloneId !== cliSessionId) {
+            bridge.linkSessionParent(cliSessionId, rewindCloneId).catch(() => {});
+            bridge.untrackSession(rewindCloneId).catch(() => {});
+          } else {
+            bridge.trackSession(cliSessionId).catch(() => {});
+          }
+          setSessionMeta({ rewindCloneSessionId: undefined });
+        }
+
+        // Promote the tab to the real session ID so it merges with the disk
+        // session. Covers the draft first message AND rewind tabs keyed by
+        // the intermediate clone (or its desk_ stdin id after the InputBar
+        // promote block).
+        if (tabId.startsWith('draft_') || rewindCloneId) {
+          // Migrate tab data under the old key to the new real key
           const chatState = useChatStore.getState();
           const tabData = chatState.getTab(tabId);
           if (tabData) {
@@ -1040,7 +1058,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             useChatStore.setState({ tabs: newTabs, sessionCache: newTabs });
           }
           useSessionStore.getState().promoteDraft(tabId, cliSessionId);
-          // Update UUID index: tab key changed from draft_* to the real UUID
+          // Update UUID index: tab key changed to the real UUID
           _persistClaudeUuid(cliSessionId, cliSessionId);
         }
 

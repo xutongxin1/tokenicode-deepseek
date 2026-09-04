@@ -101,8 +101,14 @@ export interface SessionMeta {
   duration?: number;
   turns?: number;
   sessionId?: string;
-  /** Previous session hidden after a rewind starts a replacement CLI session. */
+  /** Previous session id stashed by a rewind — the original stays visible in
+   *  the list (full history) while the rewind continues on a clone. */
   rewoundFromSessionId?: string;
+  /** Intermediate rewind clone (untracked) used as the --resume target;
+   *  cleared once the CLI's fork id arrives via stream init. */
+  rewindCloneSessionId?: string;
+  /** JSONL path of the loaded session (rewind clone source lookup). */
+  sessionPath?: string;
   /** The desk-generated ID used as key in Rust StdinManager for sending follow-up messages */
   stdinId?: string;
   /** Message ID of a pending processing card (for CLI slash commands) */
