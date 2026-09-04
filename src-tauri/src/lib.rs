@@ -1385,6 +1385,7 @@ async fn start_claude_session(
     app: AppHandle,
     state: State<'_, ProcessManager>,
     stdin_mgr: State<'_, StdinManager>,
+    activity: State<'_, SessionActivityStore>,
     params: StartSessionParams,
 ) -> Result<SessionInfo, String> {
     let session_id = params
@@ -1430,6 +1431,10 @@ async fn start_claude_session(
         args.push("--resume".to_string());
         args.push(resume_id.clone());
     }
+    // Captured for the stdout reader: when the CLI forks the resumed session,
+    // the init event reveals the fork id, which we link to this parent so
+    // load_session can merge the full history (rewind restore fix).
+    let resume_parent_for_link = params.resume_session_id.clone();
 
     if let Some(ref model) = params.model {
         args.push("--model".to_string());
@@ -1804,6 +1809,9 @@ async fn start_claude_session(
     let sid_clone = sid.clone();
     let stdin_clone = stdin_mgr.inner().clone();
     let is_bypass = permission_mode == "bypassPermissions";
+    // Last-activity recorder: the real CLI session id arrives with the init
+    // event (sid_clone may be a desk_ id that never appears in the list).
+    let activity_clone = activity.inner().clone();
     tokio::spawn(async move {
         let stream_event = format!(
             "{}:{}",
@@ -1818,6 +1826,10 @@ async fn start_claude_session(
         let mut line_count: u64 = 0;
         let mut emit_fail_count: u32 = 0;
         let spawn_time = std::time::Instant::now();
+        // Real CLI session id (set by the init event) + throttled persist state
+        // for the last-activity sidecar (see SessionActivityStore).
+        let mut real_session_id: Option<String> = None;
+        let mut last_activity_persist = std::time::Instant::now();
         loop {
             let line = match lines.next_line().await {
                 Ok(Some(line)) => line,
@@ -1833,6 +1845,44 @@ async fn start_claude_session(
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
+            // Auto-link fork→parent at init so load_session merges resumed
+            // history even if the CLI's forkedFrom refs are absent. Prefer the
+            // parent id the CLI reports, fall back to the requested resume id.
+            if json.get("type").and_then(|v| v.as_str()) == Some("system")
+                && json.get("subtype").and_then(|v| v.as_str()) == Some("init")
+            {
+                let fork_id = json
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let reported_parent = json
+                    .get("parent_session_id")
+                    .or_else(|| json.get("parentSessionId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let parent = if !reported_parent.is_empty() {
+                    reported_parent
+                } else {
+                    resume_parent_for_link.clone().unwrap_or_default()
+                };
+                if !fork_id.is_empty()
+                    && !parent.is_empty()
+                    && fork_id != parent
+                    && is_uuid_like(&fork_id)
+                    && is_uuid_like(&parent)
+                {
+                    if let Err(e) = link_session_parent_inner(&fork_id, &parent) {
+                        eprintln!("[TOKENICODE] failed to link session parent: {}", e);
+                    }
+                }
+                // Record real last-activity immediately at init (session start).
+                if !fork_id.is_empty() && is_uuid_like(&fork_id) {
+                    real_session_id = Some(fork_id.clone());
+                    activity_clone.touch_and_persist(&fork_id);
+                }
+            }
             // Keep startup diagnostics without persisting prompts, responses,
             // thinking text, tool input, or other user data in application logs.
             if line_count <= 10 {
@@ -1844,6 +1894,16 @@ async fn start_claude_session(
                     json.get("subtype").and_then(|v| v.as_str()).unwrap_or("-"),
                     line.len(),
                 );
+            }
+
+            // Record last activity on every line once the real session id is
+            // known; persist at most every 2s (stream volume can be huge).
+            if let Some(ref sid) = real_session_id {
+                activity_clone.touch(sid);
+                if last_activity_persist.elapsed().as_secs() >= 2 {
+                    activity_clone.persist();
+                    last_activity_persist = std::time::Instant::now();
+                }
             }
 
             // Intercept control_request messages for SDK control protocol routing.
@@ -2229,6 +2289,114 @@ async fn list_active_processes(
     Ok(state.active_ids().await)
 }
 
+/// ~/.tokenicode/session_activity.json — TOKENICODE's own last-activity
+/// timestamps per session (ms since epoch).
+///
+/// Why: the Claude CLI appends to its transcript file while streaming, so
+/// file mtime normally tracks conversation recency. But when TOKENICODE
+/// exits, the orphaned CLI processes see stdin EOF, flush their transcripts
+/// and exit — stamping EVERY live session's mtime with the app-close time.
+/// list_sessions would then sort all of last session's conversations as
+/// equally "recent". This sidecar records real activity (init event, stream
+/// output) so sorting reflects the last conversation, not the last app close.
+#[derive(Clone)]
+struct SessionActivityStore {
+    inner: std::sync::Arc<SessionActivityInner>,
+}
+
+struct SessionActivityInner {
+    map: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+fn session_activity_path() -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".tokenicode").join("session_activity.json")
+}
+
+impl SessionActivityStore {
+    fn load() -> Self {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(session_activity_path()) {
+            if let Ok(parsed) =
+                serde_json::from_str::<std::collections::HashMap<String, u64>>(&text)
+            {
+                map = parsed;
+            }
+        }
+        Self {
+            inner: std::sync::Arc::new(SessionActivityInner {
+                map: std::sync::Mutex::new(map),
+            }),
+        }
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Update in-memory activity (stream reader hot path — cheap lock).
+    fn touch(&self, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        let now = Self::now_ms();
+        if let Ok(mut map) = self.inner.map.lock() {
+            map.insert(session_id.to_string(), now);
+        }
+    }
+
+    /// Update and persist immediately (init event / low-frequency sites).
+    fn touch_and_persist(&self, session_id: &str) {
+        self.touch(session_id);
+        self.persist();
+    }
+
+    /// Write the map to disk, merged with the on-disk copy so concurrent
+    /// app instances (main UI + debug build) never overwrite each other's
+    /// entries — the newest timestamp per id wins.
+    fn persist(&self) {
+        let snapshot: std::collections::HashMap<String, u64> = {
+            match self.inner.map.lock() {
+                Ok(map) => map.clone(),
+                Err(_) => return,
+            }
+        };
+        let mut merged = if let Ok(text) = std::fs::read_to_string(session_activity_path()) {
+            serde_json::from_str::<std::collections::HashMap<String, u64>>(&text)
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+        for (k, v) in snapshot {
+            merged
+                .entry(k)
+                .and_modify(|e| *e = (*e).max(v))
+                .or_insert(v);
+        }
+        let path = session_activity_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(data) = serde_json::to_string(&merged) {
+            if std::fs::write(&tmp, data).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    fn get(&self, session_id: &str) -> Option<u64> {
+        self.inner
+            .map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(session_id).copied())
+    }
+}
+
 /// Path to the file tracking TOKENICODE-managed session IDs
 fn tracked_sessions_path() -> std::path::PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -2360,6 +2528,292 @@ async fn untrack_session(session_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/* ==================================================================
+   Session cloning & fork parent-chain (load-time history merge)
+   ================================================================== */
+
+/// Validate a string looks like a session UUID (hex + hyphens only).
+fn is_uuid_like(s: &str) -> bool {
+    s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Path to the sidecar mapping forked sessions to their parent sessions.
+/// Used when the CLI's own `forkedFrom` refs are absent from the JSONL.
+fn session_parents_path() -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".tokenicode").join("session_parents.json")
+}
+
+/// Read the child→parent sidecar map (missing/corrupt file → empty map).
+fn read_session_parents(
+    path: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Default::default(),
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Write the child→parent sidecar map atomically (tmp + rename).
+fn write_session_parents(
+    path: &std::path::Path,
+    map: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create .tokenicode dir: {}", e))?;
+    }
+    let body = serde_json::to_string_pretty(map)
+        .map_err(|e| format!("Failed to serialize session parents: {}", e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("Failed to write session parents: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to rename session parents: {}", e))?;
+    Ok(())
+}
+
+/// Register that `child_id` was forked from `parent_id` (sidecar chain link).
+fn link_session_parent_inner(child_id: &str, parent_id: &str) -> Result<(), String> {
+    let path = session_parents_path();
+    let mut map = read_session_parents(&path);
+    map.insert(child_id.to_string(), parent_id.to_string());
+    write_session_parents(&path, &map)
+}
+
+/// Record a fork relationship so load_session can merge the parent history
+/// even when the CLI's own forkedFrom refs are missing from the JSONL.
+#[tauri::command]
+async fn link_session_parent(child_id: String, parent_id: String) -> Result<(), String> {
+    // Never persist desk-generated temporary IDs; only real session UUIDs.
+    if child_id.starts_with("desk_") || parent_id.starts_with("desk_") {
+        return Ok(());
+    }
+    if !is_uuid_like(&child_id) || !is_uuid_like(&parent_id) || child_id == parent_id {
+        return Ok(());
+    }
+    link_session_parent_inner(&child_id, &parent_id)
+}
+
+/// Pure core of clone_session: rewrite top-level sessionId fields to the new
+/// id, strip forkedFrom refs (clones are standalone), and optionally truncate
+/// the records BEFORE the given record uuid (exclusive cut, matching the
+/// frontend's rewindToTurn slice semantics). Unparseable lines are kept
+/// verbatim so no data is lost.
+fn clone_records(
+    lines: Vec<String>,
+    new_id: &str,
+    truncate_before_uuid: Option<&str>,
+) -> Result<Vec<String>, String> {
+    struct LineRecord {
+        raw: String,
+        uuid: Option<String>,
+    }
+    let mut records: Vec<LineRecord> = lines
+        .into_iter()
+        .map(|raw| {
+            let uuid = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|v| {
+                    v.get("uuid")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string())
+                });
+            LineRecord { raw, uuid }
+        })
+        .collect();
+
+    if let Some(target) = truncate_before_uuid {
+        let idx = records
+            .iter()
+            .position(|r| r.uuid.as_deref() == Some(target))
+            .ok_or_else(|| format!("Truncation message {} not found in source session", target))?;
+        records.truncate(idx);
+    }
+
+    let mut out = Vec::with_capacity(records.len());
+    for rec in records {
+        match serde_json::from_str::<Value>(&rec.raw) {
+            Ok(Value::Object(mut obj)) => {
+                if obj.contains_key("sessionId") {
+                    obj.insert("sessionId".to_string(), Value::String(new_id.to_string()));
+                }
+                obj.remove("forkedFrom");
+                out.push(Value::Object(obj).to_string());
+            }
+            Ok(other) => out.push(other.to_string()),
+            Err(_) => out.push(rec.raw),
+        }
+    }
+    Ok(out)
+}
+
+#[derive(serde::Serialize)]
+pub struct CloneSessionResult {
+    pub session_id: String,
+    pub path: String,
+}
+
+/// Clone a session JSONL to a new session id, optionally truncated before a
+/// given record uuid. Menu clone = full copy (tracked). Rewind clone =
+/// truncated copy (untracked) that acts as the `--resume` target for the
+/// CLI's fork — the fork's history is then merged via the parent chain.
+#[tauri::command]
+async fn clone_session(
+    source_path: String,
+    truncate_before_uuid: Option<String>,
+    track: Option<bool>,
+) -> Result<CloneSessionResult, String> {
+    // Same path guard as delete_session: only allow files under
+    // ~/.claude/projects/ so a hostile frontend cannot copy arbitrary files.
+    let canonical = std::path::Path::new(&source_path)
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize source path: {}", e))?;
+    // Canonicalize BOTH sides: on Windows canonicalize() returns verbatim
+    // paths prefixed with `\\?\`, so comparing against an uncanonicalized
+    // allowed_dir would always fail and refuse every clone.
+    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
+    let allowed_dir = home
+        .join(".claude")
+        .join("projects")
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve ~/.claude/projects: {}", e))?;
+    if !canonical.starts_with(&allowed_dir) {
+        return Err(format!(
+            "Refusing to clone file outside ~/.claude/projects/: {:?}",
+            canonical
+        ));
+    }
+    let parent_dir = canonical
+        .parent()
+        .ok_or("Source file has no parent directory")?;
+
+    let lines: Vec<String> = {
+        use std::io::BufRead;
+        let file = std::fs::File::open(&canonical)
+            .map_err(|e| format!("Failed to open source session: {}", e))?;
+        std::io::BufReader::new(file).lines().map_while(Result::ok).collect()
+    };
+    if lines.is_empty() {
+        return Err("Source session file is empty".to_string());
+    }
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let cloned = clone_records(lines, &new_id, truncate_before_uuid.as_deref())?;
+    if cloned.is_empty() {
+        return Err("Clone would be empty (truncation point at session start)".to_string());
+    }
+
+    // Atomic write: temp file + rename (same pattern as untrack_session).
+    let dest = parent_dir.join(format!("{}.jsonl", new_id));
+    let tmp = parent_dir.join(format!("{}.jsonl.tmp", new_id));
+    std::fs::write(&tmp, cloned.join("\n") + "\n")
+        .map_err(|e| format!("Failed to write clone: {}", e))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("Failed to rename clone: {}", e))?;
+
+    if track.unwrap_or(true) {
+        track_session(new_id.clone()).await?;
+    }
+    Ok(CloneSessionResult {
+        session_id: new_id,
+        path: dest.to_string_lossy().to_string(),
+    })
+}
+
+/// First forkedFrom.sessionId in a fork's records (uuid-like only).
+fn first_forked_from_session(records: &[Value]) -> Option<String> {
+    for rec in records {
+        if let Some(s) = rec
+            .get("forkedFrom")
+            .and_then(|f| f.get("sessionId"))
+            .and_then(|v| v.as_str())
+        {
+            if is_uuid_like(s) {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Pure merge: prepend parent records NOT covered by the fork (fork records'
+/// own uuids ∪ forkedFrom.messageUuid). A full-copy fork (CLI 2.1.258
+/// shape, remapped uuids + per-record refs) dedupes entirely; a
+/// new-turns-only fork (no refs) gets the whole parent prepended.
+fn merge_parent_records(fork: Vec<Value>, parent: Vec<Value>) -> Vec<Value> {
+    let mut covered = std::collections::HashSet::new();
+    for rec in &fork {
+        if let Some(u) = rec.get("uuid").and_then(|v| v.as_str()) {
+            covered.insert(u.to_string());
+        }
+        if let Some(mu) = rec
+            .get("forkedFrom")
+            .and_then(|f| f.get("messageUuid"))
+            .and_then(|v| v.as_str())
+        {
+            covered.insert(mu.to_string());
+        }
+    }
+    let mut merged = Vec::with_capacity(parent.len() + fork.len());
+    for rec in parent {
+        let keep = match rec.get("uuid").and_then(|v| v.as_str()) {
+            Some(u) => !covered.contains(u),
+            None => true,
+        };
+        if keep {
+            merged.push(rec);
+        }
+    }
+    merged.extend(fork);
+    merged
+}
+
+/// Maximum parent-chain depth for load_session (cycle protection).
+const MAX_PARENT_DEPTH: usize = 8;
+
+/// Load a session file, prepending its parent chain (forkedFrom refs or the
+/// sidecar map) so forked/restored sessions show their full history.
+fn load_session_with_parents(
+    path: &std::path::Path,
+    depth: usize,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<Vec<Value>, String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open session: {}", e))?;
+    let mut records = vec![];
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(json) = serde_json::from_str::<Value>(&line) {
+            records.push(json);
+        }
+    }
+
+    let own_id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // Cycle guard: already visited or too deep → return as-is.
+    if depth >= MAX_PARENT_DEPTH || !visited.insert(own_id.clone()) {
+        return Ok(records);
+    }
+
+    let parent_id = first_forked_from_session(&records).or_else(|| {
+        read_session_parents(&session_parents_path())
+            .get(&own_id)
+            .cloned()
+    });
+    let Some(parent_id) = parent_id else {
+        return Ok(records);
+    };
+    let parent_path = path
+        .parent()
+        .map(|d| d.join(format!("{}.jsonl", parent_id)))
+        .unwrap_or_default();
+    if !parent_path.exists() {
+        return Ok(records);
+    }
+    let parent = load_session_with_parents(&parent_path, depth + 1, visited)?;
+    Ok(merge_parent_records(records, parent))
+}
+
 /// One-time cleanup: remove desk_* entries and duplicates from tracked_sessions.txt.
 /// Uses atomic write (write to temp file, then rename) to prevent truncation on crash.
 fn cleanup_tracked_sessions() {
@@ -2422,8 +2876,14 @@ async fn delete_session(session_id: String, session_path: String) -> Result<(), 
             let canonical = target
                 .canonicalize()
                 .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
+            // Canonicalize BOTH sides (see clone_session): on Windows
+            // canonicalize() returns `\\?\` verbatim paths.
             let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-            let allowed_dir = home.join(".claude").join("projects");
+            let allowed_dir = home
+                .join(".claude")
+                .join("projects")
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve ~/.claude/projects: {}", e))?;
             if !canonical.starts_with(&allowed_dir) {
                 return Err(format!(
                     "Refusing to delete file outside ~/.claude/projects/: {:?}",
@@ -2438,7 +2898,7 @@ async fn delete_session(session_id: String, session_path: String) -> Result<(), 
 }
 
 #[tauri::command]
-async fn list_sessions() -> Result<Vec<Value>, String> {
+async fn list_sessions(activity: State<'_, SessionActivityStore>) -> Result<Vec<Value>, String> {
     let home = dirs::home_dir().ok_or("Cannot find home dir")?;
     let claude_dir = home.join(".claude").join("projects");
 
@@ -2465,13 +2925,19 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
                                     continue;
                                 }
 
-                                // Get file metadata for timestamp
-                                let modified = std::fs::metadata(&path)
+                                // Get file metadata for timestamp, merged with
+                                // TOKENICODE's own activity record (see
+                                // SessionActivityStore): file mtime alone is
+                                // stamped with the app-close time for every
+                                // live session (CLI stdin-EOF flush), which
+                                // breaks recency sorting after quitting.
+                                let file_modified = std::fs::metadata(&path)
                                     .and_then(|m| m.modified())
                                     .ok()
                                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
+                                let modified = file_modified.max(activity.get(&id).unwrap_or(0));
 
                                 // Read the first few lines to extract preview and cwd.
                                 // A tracked session must remain visible even when it has no
@@ -3127,18 +3593,11 @@ fn decode_project_name(encoded: &str) -> String {
 
 #[tauri::command]
 async fn load_session(path: String) -> Result<Vec<Value>, String> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open session: {}", e))?;
-    let reader = std::io::BufReader::new(file);
-    let mut messages = vec![];
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if let Ok(json) = serde_json::from_str::<Value>(&line) {
-                messages.push(json);
-            }
-        }
-    }
-    Ok(messages)
+    // Merge the parent chain (forkedFrom refs / sidecar links) so forked and
+    // rewind-restored sessions display their full history, not just the new
+    // turns written by the CLI fork.
+    let mut visited = std::collections::HashSet::new();
+    load_session_with_parents(std::path::Path::new(&path), 0, &mut visited)
 }
 
 /// Compute billing totals and the latest occupied-context snapshot from a
@@ -5594,9 +6053,6 @@ async fn rewind_files(
     cwd: String,
 ) -> Result<String, String> {
     // P1-1: Validate session_id and checkpoint_uuid look like UUIDs (hex + hyphens only)
-    fn is_uuid_like(s: &str) -> bool {
-        s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-    }
     if !is_uuid_like(&session_id) {
         return Err(format!("Invalid session_id format: {}", session_id));
     }
@@ -8603,6 +9059,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(ProcessManager::new())
         .manage(StdinManager::new())
+        .manage(SessionActivityStore::load())
         .manage(WatcherManager::default())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -8660,6 +9117,8 @@ pub fn run() {
             list_active_processes,
             track_session,
             untrack_session,
+            clone_session,
+            link_session_parent,
             delete_session,
             list_sessions,
             get_profile_stats,
@@ -8746,7 +9205,12 @@ pub fn run() {
 
 #[cfg(test)]
 mod decode_tests {
-    use super::{compute_session_tokens, decode_project_name, extract_session_info, provider_messages_endpoint};
+    use super::{
+        clone_records, compute_session_tokens, decode_project_name, extract_session_info,
+        merge_parent_records, provider_messages_endpoint, read_session_parents,
+        write_session_parents,
+    };
+    use serde_json::Value;
 
     #[test]
     fn test_session_tokens_use_latest_context_and_deduplicate_blocks() {
@@ -8760,6 +9224,113 @@ mod decode_tests {
         assert_eq!(usage["totalOutputTokens"], 30);
         assert_eq!(usage["contextInputTokens"], 1100);
         assert_eq!(usage["contextOutputTokens"], 10);
+    }
+
+    #[test]
+    fn test_clone_records_truncates_and_rewrites() {
+        let lines = vec![
+            r#"{"uuid":"u1","sessionId":"old-aaaa-aaaa-aaaa-aaaaaaaaaaaa","type":"user"}"#.to_string(),
+            r#"{"uuid":"u2","sessionId":"old-aaaa-aaaa-aaaa-aaaaaaaaaaaa","type":"assistant"}"#.to_string(),
+            r#"{"uuid":"u3","sessionId":"old-aaaa-aaaa-aaaa-aaaaaaaaaaaa","type":"user","forkedFrom":{"sessionId":"old-aaaa-aaaa-aaaa-aaaaaaaaaaaa","messageUuid":"x"}}"#.to_string(),
+            r#"not valid json"#.to_string(),
+        ];
+        // Exclusive cut at u3 → keep u1, u2 only (u3 is the rewind turn itself)
+        let out = clone_records(lines, "new-bbbb-bbbb-bbbb-bbbbbbbbbbbb", Some("u3"))
+            .expect("clone should succeed");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains(r#""sessionId":"new-bbbb-bbbb-bbbb-bbbbbbbbbbbb""#));
+        assert!(out[1].contains(r#""sessionId":"new-bbbb-bbbb-bbbb-bbbbbbbbbbbb""#));
+        assert!(!out[0].contains("old-aaaa"));
+    }
+
+    #[test]
+    fn test_clone_records_full_copy_strips_forked_from() {
+        let lines = vec![
+            r#"{"uuid":"u1","sessionId":"old-aaaa-aaaa-aaaa-aaaaaaaaaaaa","type":"user","forkedFrom":{"sessionId":"anc","messageUuid":"m"}}"#.to_string(),
+            r#"{"uuid":"u2","type":"assistant"}"#.to_string(), // no sessionId — untouched
+            r#"garbage line"#.to_string(), // kept verbatim
+        ];
+        let out = clone_records(lines, "new-bbbb-bbbb-bbbb-bbbbbbbbbbbb", None)
+            .expect("clone should succeed");
+        assert_eq!(out.len(), 3);
+        assert!(!out[0].contains("forkedFrom"));
+        assert!(!out[0].contains("old-aaaa"));
+        assert_eq!(out[1], r#"{"type":"assistant","uuid":"u2"}"#);
+        assert_eq!(out[2], "garbage line");
+    }
+
+    #[test]
+    fn test_clone_records_missing_uuid_errors() {
+        let lines = vec![r#"{"uuid":"u1","type":"user"}"#.to_string()];
+        let err = clone_records(lines, "new-bbbb-bbbb-bbbb-bbbbbbbbbbbb", Some("nope"))
+            .expect_err("missing truncation uuid must error");
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_merge_parent_full_fork_dedupes() {
+        // CLI 2.1.258 full-copy fork: every fork record carries
+        // forkedFrom.messageUuid covering the parent record's uuid.
+        let parent: Vec<Value> = vec![
+            serde_json::json!({"uuid": "p1", "type": "user"}),
+            serde_json::json!({"uuid": "p2", "type": "assistant"}),
+        ];
+        let fork: Vec<Value> = vec![
+            serde_json::json!({"uuid": "f1", "type": "user", "forkedFrom": {"sessionId": "parent-id", "messageUuid": "p1"}}),
+            serde_json::json!({"uuid": "f2", "type": "assistant", "forkedFrom": {"sessionId": "parent-id", "messageUuid": "p2"}}),
+            serde_json::json!({"uuid": "f3", "type": "user"}),
+        ];
+        let merged = merge_parent_records(fork, parent);
+        assert_eq!(merged.len(), 3, "all parent records covered → no duplicates");
+        let uuids: Vec<&str> = merged.iter().filter_map(|v| v["uuid"].as_str()).collect();
+        assert_eq!(uuids, vec!["f1", "f2", "f3"]);
+    }
+
+    #[test]
+    fn test_merge_parent_new_turns_only_prepends() {
+        // Old CLI shape: fork file has no refs → parent fully prepended.
+        let parent: Vec<Value> = vec![
+            serde_json::json!({"uuid": "p1", "type": "user"}),
+            serde_json::json!({"uuid": "p2", "type": "assistant"}),
+        ];
+        let fork: Vec<Value> = vec![
+            serde_json::json!({"uuid": "f1", "type": "user"}),
+        ];
+        let merged = merge_parent_records(fork, parent);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0]["uuid"], "p1");
+        assert_eq!(merged[2]["uuid"], "f1");
+    }
+
+    #[test]
+    fn test_merge_parent_partial_coverage() {
+        let parent: Vec<Value> = vec![
+            serde_json::json!({"uuid": "p1", "type": "user"}),
+            serde_json::json!({"uuid": "p2", "type": "assistant"}),
+        ];
+        let fork: Vec<Value> = vec![
+            // Only p1 is referenced → p2 must still be prepended.
+            serde_json::json!({"uuid": "f1", "type": "user", "forkedFrom": {"sessionId": "parent-id", "messageUuid": "p1"}}),
+            serde_json::json!({"uuid": "f2", "type": "assistant"}),
+        ];
+        let merged = merge_parent_records(fork, parent);
+        let uuids: Vec<&str> = merged.iter().filter_map(|v| v["uuid"].as_str()).collect();
+        assert_eq!(uuids, vec!["p2", "f1", "f2"]);
+    }
+
+    #[test]
+    fn test_session_parents_roundtrip() {
+        let path = std::env::temp_dir().join(format!(
+            "tokenicode-parents-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut map = std::collections::HashMap::new();
+        map.insert("child-id-1111-1111-1111-111111111111".to_string(), "parent-id-2222-2222-2222-222222222222".to_string());
+        write_session_parents(&path, &map).expect("write parents");
+        let read = read_session_parents(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read.get("child-id-1111-1111-1111-111111111111"),
+            Some(&"parent-id-2222-2222-2222-222222222222".to_string()));
     }
 
     #[test]

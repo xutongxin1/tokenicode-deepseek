@@ -41,36 +41,50 @@ export const KNOWN_FILE_EXTENSIONS = new Set([
   'env', 'conf', 'cfg', 'ini', 'xml', 'sql', 'graphql', 'gql', 'proto',
   'lock', 'log', 'txt', 'csv', 'rb', 'php', 'java', 'kt', 'swift', 'c',
   'cpp', 'h', 'hpp', 'cs', 'r', 'lua', 'zig', 'ex', 'exs', 'erl', 'ml',
-  'mli', 'tf', 'hcl', 'dockerfile', 'makefile', 'png', 'jpg', 'jpeg',
+  'mli', 'tf', 'hcl', 'dockerfile', 'makefile', 'mat', 'png', 'jpg', 'jpeg',
   'gif', 'svg', 'webp', 'ico', 'wasm', 'map',
 ]);
 
+/** Extension alternatives shared by the two bare-name regexes below. */
+const KNOWN_EXT_ALT = 'md|mdx|ts|tsx|js|jsx|mjs|cjs|json|jsonl|toml|yaml|yml|py|pyi|rs|go|html|htm|css|scss|sass|less|vue|svelte|sh|bash|zsh|fish|env|conf|cfg|ini|xml|sql|graphql|gql|proto|lock|log|txt|csv|rb|php|java|kt|swift|c|cpp|h|hpp|cs|r|lua|zig|ex|exs|erl|ml|mli|tf|hcl|dockerfile|makefile|mat';
+
 /** Bare filenames with known code/config extensions (CLAUDE.md, package.json). */
-export const KNOWN_EXT_RE = /^[\w][\w.-]*\.(?:md|mdx|ts|tsx|js|jsx|mjs|cjs|json|jsonl|toml|yaml|yml|py|pyi|rs|go|html|htm|css|scss|sass|less|vue|svelte|sh|bash|zsh|fish|env|conf|cfg|ini|xml|sql|graphql|gql|proto|lock|log|txt|csv|rb|php|java|kt|swift|c|cpp|h|hpp|cs|r|lua|zig|ex|exs|erl|ml|mli|tf|hcl|dockerfile|makefile)$/i;
+export const KNOWN_EXT_RE = new RegExp(`^[\\w][\\w.-]*\\.(?:${KNOWN_EXT_ALT})$`, 'i');
+
+/** Bare known-extension filenames in prose (chunk_XX.mat, make_v2.py) —
+ *  wrapped into inline code so the `code` handler can make them clickable.
+ *  The prefix class rejects `/`, `\`, backticks AND hyphens, so a filename
+ *  that is the tail of a longer path is never double-wrapped — the hyphen
+ *  rejection matters for UUID tails (`…/55433fdd-fea3….jsonl` was re-wrapped
+ *  as `fea3….jsonl` inside an already-wrapped full path). */
+const BARE_KNOWN_NAME_RE = new RegExp(`(^|[^\`\\w.:@#/\\\\-])([\\w][\\w.-]*\\.(?:${KNOWN_EXT_ALT}))(?=[\`\\s,，。;；:：)）]|$)`, 'gi');
 
 /**
  * Detect file paths in inline code — conservative regex to avoid false
  * positives. Matches: absolute paths (/foo.ts, C:\foo.ts), path-prefixed
- * files (./bar.md, src/baz.rs), dot-directory paths (.history/foo.py) and
- * bare filenames with known extensions (handled separately via KNOWN_EXT_RE).
+ * files (./bar.md, src/baz.rs, tmp/logs/x.txt), dot-directory paths
+ * (.history/foo.py) and bare filenames with known extensions (handled
+ * separately via KNOWN_EXT_RE). The generic segment branch
+ * (`[\w@+-][\w.@+-]*[\\/]`) covers any project-relative directory, while
+ * the `(?!\.)` guard keeps truncated `.../xxx.jsonl` paths from matching.
  */
-export const FILE_PATH_RE = /^(?:\/|\.\.?[\\/]|\.[\w.-]+[\\/]|[a-zA-Z]:[\\/]|(?:src|lib|components|stores|hooks|utils|tests|__tests__)[\\/])[\w.@/\\ -]+\.\w{1,10}$/;
+export const FILE_PATH_RE = /^(?:\/|\.\.?[\\/]|\.(?!\.)[\w.-]*[\\/]|[\w@+-][\w.@+-]*[\\/]|[a-zA-Z]:[\\/])[\w.@/\\ -]+\.\w{1,10}$/;
 
 /**
  * Bare (non-backticked) file paths in prose. Matches absolute paths
- * (/, C:\..., C:/...), relative (./..., ../...) and common project-relative
- * paths (src/..., lib/..., etc.). Windows absolute paths may contain spaces.
- * The prefix class excludes `.` so truncated paths with leading ellipses
- * (`.../55433fdd-....jsonl`) are never wrapped.
+ * (/, C:\..., C:/...), relative (./..., ../...) and any project-relative
+ * path (tmp/v0789_probe/log_w1..6.txt, src/foo.ts). Windows absolute paths
+ * may contain spaces. The `(?!\.)` guard keeps truncated paths with leading
+ * ellipses (`.../55433fdd-....jsonl`) from being wrapped.
  */
-export const BARE_PATH_RE = /(^|[^`\w.:@#/])((?:(?:\/|\.\.?\/|\.[\w.-]+\/)[\w.@/+-]+\.\w{1,10}|(?:src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config)\/[\w.@/+-]+\.\w{1,10}|[a-zA-Z]:[\\/](?:[\w.@+ -]+[\\/])*[\w.@+ -]+\.\w{1,10}))(?![`\w.])/g;
+export const BARE_PATH_RE = /(^|[^`\w.:@#/])((?:\/(?:[\w.@+-]+\/)*[\w.@+-]+\.\w{1,10}|(?:\.\.?\/|\.(?!\.)[\w.-]*\/|[\w@+-][\w.@+-]*\/)+[\w.@+-]+\.\w{1,10}|[a-zA-Z]:[\\/](?:[\w.@+ -]+[\\/])*[\w.@+ -]+\.\w{1,10}))(?![`\w.])/g;
 
 /**
  * Folder paths (trailing separator) in inline code — e.g. `src/components/`,
- * `C:\Users\xtx\.claude\`. The trailing slash/backslash is what marks a
- * path as a directory rather than a file.
+ * `C:\Users\xtx\.claude\`, `tmp/logs/`. The trailing slash/backslash is what
+ * marks a path as a directory rather than a file.
  */
-export const FOLDER_PATH_RE = /^(?:\/|\.\.?[\\/]|\.[\w.-]+[\\/]|[a-zA-Z]:[\\/]|(?:src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config|docs|build|dist|scripts|node_modules)[\\/])[\w.@/\\ +-]+[\\/]$/;
+export const FOLDER_PATH_RE = /^(?:\/|\.\.?[\\/]|\.(?!\.)[\w.-]*[\\/]|[\w@+-][\w.@+-]*[\\/]|[a-zA-Z]:[\\/])[\w.@/\\ +-]+[\\/]$/;
 
 /**
  * Bare folder paths in prose — same shape as BARE_PATH_RE but requiring a
@@ -78,7 +92,7 @@ export const FOLDER_PATH_RE = /^(?:\/|\.\.?[\\/]|\.[\w.-]+[\\/]|[a-zA-Z]:[\\/]|(
  * the directory prefix of a longer path (`src/components/foo.ts` or
  * `C:/Users/xtx/.claude/...` must not become a folder chip for the prefix).
  */
-export const BARE_FOLDER_PATH_RE = /(^|[^`\w.:@#/])((?:\/|\.\.?\/|\.[\w.-]+\/)[\w.@/+-]+\/|(?:src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config|docs|build|dist|scripts|node_modules)\/[\w.@/+-]+\/|[a-zA-Z]:[\\/](?:[\w.@+ -]+[\\/])+)(?![`\w.])/g;
+export const BARE_FOLDER_PATH_RE = /(^|[^`\w.:@#/])((?:\/|\.\.?\/|\.(?!\.)[\w.-]*\/|[\w@+-][\w.@+-]*\/)+[\w.@+-]+\/|[a-zA-Z]:[\\/](?:[\w.@+ -]+[\\/])+)(?![`\w.])/g;
 
 /**
  * Path-shaped text with no trailing separator — used to detect directory
@@ -88,9 +102,9 @@ export const BARE_FOLDER_PATH_RE = /(^|[^`\w.:@#/])((?:\/|\.\.?\/|\.[\w.-]+\/)[\
  * paths in backticks; the callback skips anything whose last segment has a
  * known file extension (those are handled by BARE_PATH_RE).
  */
-export const DIR_CANDIDATE_RE = /^(?:\/|\.\.?[\\/]|\.[\w.-]+[\\/]|[a-zA-Z]:[\\/]|(?:src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config|docs|build|dist|scripts|node_modules)[\\/])[\w.@/\\ +-]+$/;
+export const DIR_CANDIDATE_RE = /^(?:\/|\.\.?[\\/]|\.(?!\.)[\w.-]*[\\/]|[\w@+-][\w.@+-]*[\\/]|[a-zA-Z]:[\\/])[\w.@/\\ +-]+$/;
 
-export const BARE_DIR_CANDIDATE_RE = /(^|[^`\w.:@#/])((?:\/|\.\.?\/|\.[\w.-]+\/)[\w.@/+-]+|(?:src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config|docs|build|dist|scripts|node_modules)\/[\w.@/+-]+|[a-zA-Z]:[\\/](?:[\w.@+ -]+[\\/])*[\w.@+ -]+)(?![`\w./\\])/g;
+export const BARE_DIR_CANDIDATE_RE = /(^|[^`\w.:@#/])((?:\/|\.\.?\/|\.(?!\.)[\w.-]*\/|[\w@+-][\w.@+-]*\/)+[\w.@+-]+|[a-zA-Z]:[\\/](?:[\w.@+ -]+[\\/])*[\w.@+ -]+)(?![`\w./\\])/g;
 
 /** Last path segment contains no dot → directory candidate. A dot inside
  *  the segment marks a file extension (deferred to the file-path logic,
@@ -142,7 +156,7 @@ export function wrapBareFilePaths(content: string): string {
         if (!looksLikeDirectory(path)) return match;
         return `${prefix}\`${path}\``;
       });
-      return dirsWrapped.replace(BARE_PATH_RE, (match, prefix, path, offset, str) => {
+      const pathsWrapped = dirsWrapped.replace(BARE_PATH_RE, (match, prefix, path, offset, str) => {
         const pathStart = offset + prefix.length;
         // Don't wrap if inside a markdown link target: ...](path)
         if (insideMarkdownLinkTarget(str, pathStart)) return match;
@@ -150,6 +164,14 @@ export function wrapBareFilePaths(content: string): string {
         const ext = path.split('.').pop()?.toLowerCase();
         if (!ext || !KNOWN_FILE_EXTENSIONS.has(ext)) return match;
         return `${prefix}\`${path}\``;
+      });
+      // Bare filenames with known extensions in prose (make_v2.py, chunk_XX.mat).
+      // The prefix class rejects backticks and path separators, so filenames
+      // already wrapped above (or tails of longer paths) are never re-wrapped.
+      return pathsWrapped.replace(BARE_KNOWN_NAME_RE, (match, prefix, name, offset, str) => {
+        const nameStart = offset + prefix.length;
+        if (insideMarkdownLinkTarget(str, nameStart)) return match;
+        return `${prefix}\`${name}\``;
       });
     }).join('');
   }).join('');

@@ -1230,8 +1230,10 @@ export function InputBar() {
           spawnedModel: liveResolvedModel,
         });
 
-        // Rewind replaces the visible history instead of leaving old and new
-        // branches side-by-side. The old JSONL remains on disk for recovery.
+        // Rewind continues on a fork while the original session stays visible
+        // in the list with its full history. The intermediate clone
+        // (rewindCloneSessionId) is linked to the fork and hidden once the
+        // CLI's own session id arrives via stream init.
         if (rewoundFromSessionId && session.session_id !== tabId) {
           const chatState = useChatStore.getState();
           const tabData = chatState.getTab(tabId);
@@ -1242,9 +1244,6 @@ export function InputBar() {
             useChatStore.setState({ tabs: newTabs, sessionCache: newTabs });
           }
           useSessionStore.getState().promoteDraft(tabId, session.session_id);
-          bridge.untrackSession(rewoundFromSessionId).catch((error) => {
-            console.warn('[TOKENICODE:rewind] failed to hide superseded session:', error);
-          });
           tabId = session.session_id;
         }
         // Note: stdinId → tabId mapping already registered before listener setup (TK-329)

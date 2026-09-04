@@ -402,7 +402,7 @@ export function ConversationList() {
     // TK-329: explicitly clear stdinId when loading from disk — no live process exists yet.
     // Only set the CLI UUID (for resume). Prevents inheriting a stale stdinId
     // from a previous session that might still be alive in the backend.
-    setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+    setSessionMeta(sessionId, { sessionId, stdinId: undefined, sessionPath });
 
     try {
       const rawMessages = await bridge.loadSession(sessionPath);
@@ -534,6 +534,23 @@ export function ConversationList() {
   const handleRevealInFinder = useCallback((session: SessionListItem) => {
     if (session.path) bridge.revealInFinder(session.path).catch(() => {});
   }, []);
+
+  // Clone a session to a new id (full copy, tracked) and open the clone.
+  const handleClone = useCallback(async (session: SessionListItem) => {
+    if (!session.path) return;
+    try {
+      const res = await bridge.cloneSession(session.path, null, true);
+      await fetchSessions();
+      const cloneItem = useSessionStore.getState().sessions.find((s) => s.id === res.session_id);
+      if (cloneItem) {
+        await handleLoadSession(cloneItem);
+      } else {
+        setSelected(res.session_id);
+      }
+    } catch (err) {
+      console.error('[conversations] clone failed:', err);
+    }
+  }, [fetchSessions, handleLoadSession, setSelected]);
 
   const handleExportMarkdown = useCallback(async (session: SessionListItem) => {
     if (!session.path) return;
@@ -1048,6 +1065,7 @@ export function ConversationList() {
           y={contextMenu.y}
           session={contextMenu.session}
           onRename={handleRenameFromMenu}
+          onClone={handleClone}
           onRevealInFinder={handleRevealInFinder}
           onExport={handleExportMarkdown}
           onDelete={handleDeleteSingle}

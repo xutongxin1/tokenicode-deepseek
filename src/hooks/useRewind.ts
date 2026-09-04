@@ -72,18 +72,67 @@ export function useRewind() {
     }
   }, []);
 
-  /** Reset session state after rewind. The old CLI ID is retained only as a
-   * replacement marker so it can be hidden after the new branch is created. */
-  const resetSession = useCallback(() => {
-    const tid = useSessionStore.getState().selectedSessionId;
-    if (!tid) return;
-    const previousSessionId = useChatStore.getState().getTab(tid)?.sessionMeta.sessionId;
+  /**
+   * Reset session state after rewind by cloning the pre-rewind session
+   * immediately (visible in the list) and switching the current tab to the
+   * clone. The original stays visible with its full history; the clone
+   * (truncated to the rewind point) becomes the active tab and the --resume
+   * target for the next message. Falls back to the old fresh-spawn behavior
+   * when the previous session can't be cloned (desk id, no path).
+   * Returns the tab id to continue on (the clone id, or `tid` on fallback).
+   */
+  const resetSessionWithClone = useCallback(async (
+    tid: string,
+    previousSessionId: string | undefined,
+    previousPath: string | undefined,
+    truncateBeforeUuid: string | undefined,
+  ): Promise<string> => {
     useChatStore.getState().setSessionStatus(tid, 'idle');
-    useChatStore.getState().setSessionMeta(tid, {
-      stdinId: undefined,
-      sessionId: undefined,
-      rewoundFromSessionId: previousSessionId,
-    });
+    const canClone = previousSessionId
+      && !previousSessionId.startsWith('desk_')
+      && previousPath;
+    if (!canClone) {
+      useChatStore.getState().setSessionMeta(tid, {
+        stdinId: undefined,
+        sessionId: undefined,
+        rewoundFromSessionId: previousSessionId,
+      });
+      return tid;
+    }
+    try {
+      // Exclusive truncation: the clone ends just before the selected turn.
+      // track=true — the clone appears in the list the moment the rewind
+      // happens (hidden again once the CLI's fork id arrives on the next
+      // message).
+      const clone = await bridge.cloneSession(previousPath!, truncateBeforeUuid ?? null, true);
+      const chatState = useChatStore.getState();
+      const tabData = chatState.getTab(tid);
+      if (tabData && clone.session_id !== tid) {
+        // Move the truncated view to the clone tab so the user continues there
+        const newTabs = new Map(chatState.tabs);
+        newTabs.set(clone.session_id, { ...tabData, tabId: clone.session_id });
+        newTabs.delete(tid);
+        useChatStore.setState({ tabs: newTabs, sessionCache: newTabs });
+      }
+      useChatStore.getState().setSessionMeta(clone.session_id, {
+        stdinId: undefined,
+        sessionId: clone.session_id,
+        sessionPath: clone.path,
+        rewoundFromSessionId: previousSessionId,
+        rewindCloneSessionId: clone.session_id,
+      });
+      useSessionStore.getState().setSelectedSession(clone.session_id);
+      useSessionStore.getState().fetchSessions();
+      return clone.session_id;
+    } catch (err) {
+      console.error('[useRewind] clone-for-resume failed, falling back to fresh spawn:', err);
+      useChatStore.getState().setSessionMeta(tid, {
+        stdinId: undefined,
+        sessionId: undefined,
+        rewoundFromSessionId: previousSessionId,
+      });
+      return tid;
+    }
   }, []);
 
   /** Save rewound state to tab cache */
@@ -109,6 +158,12 @@ export function useRewind() {
       return;
     }
 
+    // Capture pre-rewind identity before any mutation: the resume clone is
+    // created from the original JSONL, so its id and path must be read here.
+    const previousSessionId = state.sessionMeta.sessionId;
+    const previousPath = state.sessionMeta.sessionPath
+      ?? useSessionStore.getState().sessions.find((s) => s.id === previousSessionId)?.path;
+
     // For file-restore actions, send rewind via stdin BEFORE killing the process
     // (SDK control protocol is fast and needs the process alive)
     const needsFileRestore = action === 'restore_all' || action === 'restore_code';
@@ -133,8 +188,8 @@ export function useRewind() {
       switch (action) {
         case 'restore_all': {
           useChatStore.getState().rewindToTurn(tid, turn.startMsgIdx);
-          resetSession();
-          useChatStore.getState().setInputDraft(tid, originalUserText);
+          const nextTabId = await resetSessionWithClone(tid, previousSessionId, previousPath, turn.userMessageId);
+          useChatStore.getState().setInputDraft(nextTabId, originalUserText);
 
           const successMsg = fileRestoreOk
             ? t('rewind.successAll').replace('{n}', String(turn.index))
@@ -146,8 +201,8 @@ export function useRewind() {
         case 'restore_conversation': {
           // Only restore conversation (keep code as-is) — instant, no CLI call
           useChatStore.getState().rewindToTurn(tid, turn.startMsgIdx);
-          resetSession();
-          useChatStore.getState().setInputDraft(tid, originalUserText);
+          const nextTabId = await resetSessionWithClone(tid, previousSessionId, previousPath, turn.userMessageId);
+          useChatStore.getState().setInputDraft(nextTabId, originalUserText);
 
           showToast(t('rewind.success').replace('{n}', String(turn.index)), 'success');
           break;
@@ -155,8 +210,8 @@ export function useRewind() {
 
         case 'restore_code': {
           // Don't truncate messages — keep full conversation
-          resetSession();
-          useChatStore.getState().setInputDraft(tid, originalUserText);
+          const nextTabId = await resetSessionWithClone(tid, previousSessionId, previousPath, undefined);
+          useChatStore.getState().setInputDraft(nextTabId, originalUserText);
 
           const codeMsg = fileRestoreOk
             ? t('rewind.successCode').replace('{n}', String(turn.index))
@@ -184,7 +239,7 @@ export function useRewind() {
 
           // Truncate to selected point
           useChatStore.getState().rewindToTurn(tid, turn.startMsgIdx);
-          resetSession();
+          const nextTabId = await resetSessionWithClone(tid, previousSessionId, previousPath, turn.userMessageId);
 
           // Add summary as a system message (preserves context without full messages)
           const totalTurns = turns.length;
@@ -193,7 +248,7 @@ export function useRewind() {
             .replace('{to}', String(totalTurns));
           const summaryContent = `**${summaryHeader}**\n\n${summaryParts.join('\n\n')}`;
 
-          useChatStore.getState().addMessage(tid, {
+          useChatStore.getState().addMessage(nextTabId, {
             id: generateMessageId(),
             role: 'system',
             type: 'text',
@@ -208,12 +263,12 @@ export function useRewind() {
     } catch (err) {
       console.error('[useRewind] executeRewind failed:', err);
       // Ensure we're in a recoverable state even if rewind failed
-      resetSession();
+      await resetSessionWithClone(tid, previousSessionId, previousPath, undefined);
     }
 
     // Save to cache
     saveToTab();
-  }, [killProcess, resetSession, saveToTab, turns.length]);
+  }, [killProcess, resetSessionWithClone, saveToTab, turns.length]);
 
   return { turns, showRewind, canRewind, executeRewind };
 }
